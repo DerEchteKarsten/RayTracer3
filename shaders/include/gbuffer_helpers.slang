@@ -78,6 +78,10 @@ float perceptual_roughness_to_roughness(float r) {
     return r * r;
 }
 
+float3 world_pos_from_depth(float depth, uint2 pixelCoord, PlanarViewConstants view) {
+    return view.cameraDirectionOrPosition.xyz + view_dir(pixelCoord, view) * depth;
+}
+
 float3 view_dir(uint2 pixelCoord, PlanarViewConstants view) {
     const var pixelCenter = float2(pixelCoord) + float2(0.5);
     const var inUV = pixelCenter/float2(view.viewportSize);

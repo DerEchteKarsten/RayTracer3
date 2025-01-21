@@ -50,6 +50,9 @@ struct GConst {
     float blendfactor;
     uint bounces;
     uint samples;
+
+    uint proberng;
+    uint3 pad;
 };
 
 struct RayPayload {

@@ -66,6 +66,8 @@ struct GConst {
     pub blendfactor: f32,
     pub bounces: u32,
     pub samples: u32,
+    pub proberng: u32,
+    pub buffer: [u32; 3]
 }
 
 fn main() {
@@ -193,11 +195,16 @@ fn main() {
         render_graph.swpachain_format(),
         ImageSize::Viewport,
     );
-    render_graph.add_image_resource(
+    render_graph.add_temporal_image_resource(
         &mut ctx,
         "ProbeAtlas",
-        render_graph.swpachain_format(),
-        ImageSize::ViewportFractiom { x: 0.5, y: 0.5 },
+        vk::Format::R32G32B32A32_SFLOAT,
+        ImageSize::ViewportFraction { x: 0.5, y: 0.5 },
+    );
+    render_graph.add_buffer_resource(
+        &mut ctx,
+        "SphericalHarmonics",
+        (WINDOW_SIZE.y as u64 * WINDOW_SIZE.x as u64 * (9 * 4 * 3)).div_ceil(16),
     );
     render_graph.add_temporal_image_resource(
         &mut ctx,
@@ -227,8 +234,32 @@ fn main() {
             )
             .bindles_descriptor(true)
             .write("ProbeAtlas")
+            .read_previous("ProbeAtlas")
             .read("GBuffer")
             .read("GBufferDepth"),
+        )
+        .add_pass(
+            PassBuilder::new_compute(
+                "SphericalHarmonics",
+                ComputePassBuilder::default()
+                    .shader("spherical_harmonic_conversion.slang.spv")
+                    .dispatch((WINDOW_SIZE.x as u32).div_ceil(16), (WINDOW_SIZE.y as u32).div_ceil(16), 1),
+            )
+            .write("SphericalHarmonics")
+            .read("ProbeAtlas"),
+        )
+        .add_pass(
+            PassBuilder::new_compute(
+                "InterpolateProbes",
+                ComputePassBuilder::default()
+                    .shader("interpolate_probes.slang.spv")
+                    .dispatch(WINDOW_SIZE.x as u32 / 8, WINDOW_SIZE.y as u32 / 8, 1),
+            )
+            .bindles_descriptor(true)
+            .read("GBuffer")
+            .read("GBufferDepth")
+            .read("SphericalHarmonics")
+            .write("Light"),
         )
         // .add_pass(
         //     PassBuilder::new_raytracing(
@@ -255,7 +286,7 @@ fn main() {
             .read("Light")
             .write("Out"),
         )
-        .set_back_buffer_source("ProbeAtlas");
+        .set_back_buffer_source("Out");
 
     render_graph.compile(frame, &mut ctx, &raytracing_ctx);
     let mut imgui = ImGui::new(&ctx, &render_graph, &window);
@@ -279,6 +310,7 @@ fn main() {
     gconst.bounces = 4;
     let mut frame_time = Duration::default();
     let mut last_time = Instant::now();
+    let mut show_atlas = false;
 
     #[allow(clippy::collapsible_match, clippy::single_match, deprecated)]
     event_loop
@@ -314,6 +346,11 @@ fn main() {
                         gconst.planar_view_constants = camera.planar_view_constants();
                         gconst.frame = render_graph.frame_number.try_into().unwrap_or(0);
                         render_graph.update_uniform(&gconst);
+                        if show_atlas {
+                            render_graph.back_buffer = "ProbeAtlas".to_string();
+                        }else {
+                            render_graph.back_buffer = "Out".to_string();
+                        }
                         render_graph.draw(&ctx, &raytracing_ctx, &mut imgui, &window, |ui| {
                             ui.window("Constants Editor")
                                 .size([300.0, WINDOW_SIZE.y as f32], Condition::FirstUseEver)
@@ -325,7 +362,7 @@ fn main() {
                                         frame_time
                                     ));
                                     ui.slider(
-                                        "Spatial Depth Threshold",
+                                        "Blendfactor",
                                         0.0,
                                         1.0,
                                         &mut gconst.blendfactor,
@@ -336,6 +373,8 @@ fn main() {
                                     ui.input_scalar("Bounces", &mut gconst.bounces)
                                         .step(1)
                                         .build();
+                                    ui.checkbox_flags("ProbeRng", &mut gconst.proberng, 0x1);
+                                    ui.checkbox("Show Atlas", &mut show_atlas)
                                 });
                         });
                     }

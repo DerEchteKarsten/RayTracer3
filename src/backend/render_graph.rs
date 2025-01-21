@@ -150,7 +150,7 @@ pub struct RenderGraph {
     resources: HashMap<String, Resource>,
     pub static_resources: StaticResources,
     passes: Vec<RenderPass>,
-    back_buffer: String,
+    pub back_buffer: String,
 
     static_descriptor_set: vk::DescriptorSet,
     static_descriptor_set_layout: vk::DescriptorSetLayout,
@@ -169,7 +169,7 @@ struct FrameData {
 pub enum ImageSize {
     Custom { x: u32, y: u32 },
     Viewport,
-    ViewportFractiom { x: f32, y: f32 },
+    ViewportFraction { x: f32, y: f32 },
 }
 
 impl RenderGraph {
@@ -430,7 +430,7 @@ impl RenderGraph {
         let (width, height) = match size {
             ImageSize::Custom { x, y } => (x, y),
             ImageSize::Viewport => (WINDOW_SIZE.x as u32, WINDOW_SIZE.y as u32),
-            ImageSize::ViewportFractiom { x, y } => (
+            ImageSize::ViewportFraction { x, y } => (
                 (WINDOW_SIZE.x as f32 * x) as u32,
                 (WINDOW_SIZE.y as f32 * y) as u32,
             ),
@@ -468,6 +468,28 @@ impl RenderGraph {
         );
     }
 
+    pub fn add_buffer_resource(
+        &mut self,
+        ctx: &mut Context,
+        name: &str,
+        size: u64,
+    ) {
+        let buffer = Buffer::new(ctx, vk::BufferUsageFlags::STORAGE_BUFFER, gpu_allocator::MemoryLocation::GpuOnly, size).unwrap();
+
+        let label = vk::DebugUtilsObjectNameInfoEXT::default()
+            .object_handle(buffer.buffer)
+            .object_name(unsafe { CStr::from_ptr(name.to_string().as_ptr() as _) });
+        unsafe { ctx.debug_utils.set_debug_utils_object_name(&label) }.unwrap();
+
+        self.resources.insert(
+            name.to_string(),
+            Resource {
+                handle: ResourceTemporal::Single(ResourceData::Buffer(buffer)),
+                ty: ResourceType::Buffer,
+            },
+        );
+    }
+
     pub fn add_temporal_image_resource(
         &mut self,
         ctx: &mut Context,
@@ -478,7 +500,7 @@ impl RenderGraph {
         let (width, height) = match size {
             ImageSize::Custom { x, y } => (x, y),
             ImageSize::Viewport => (WINDOW_SIZE.x as u32, WINDOW_SIZE.y as u32),
-            ImageSize::ViewportFractiom { x, y } => (
+            ImageSize::ViewportFraction { x, y } => (
                 (WINDOW_SIZE.x as f32 * x) as u32,
                 (WINDOW_SIZE.y as f32 * y) as u32,
             ),
