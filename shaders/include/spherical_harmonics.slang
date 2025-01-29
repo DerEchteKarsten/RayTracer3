@@ -55,7 +55,7 @@ float3 sh2Unproject(sh2 functionShX, sh2 functionShY, sh2 functionShZ, float3 di
 }
 
 float matrix_dot(sh3 sh1, sh3 sh) {
-	return sh1[0][0]*sh[0][0] + sh1[0][1]*sh[0][1] * sh1[0][2]*sh[0][2]
+	return sh1[0][0]*sh[0][0] + sh1[0][1]*sh[0][1] + sh1[0][2]*sh[0][2]
 		 + sh1[1][0]*sh[1][0] + sh1[1][1]*sh[1][1] + sh1[1][2]*sh[1][2]
 		 + sh1[2][0]*sh[2][0] + sh1[2][1]*sh[2][1] + sh1[2][2]*sh[2][2];
 }
@@ -91,10 +91,29 @@ float3 sh3Unproject(sh3 functionShX, sh3 functionShY, sh3 functionShZ, float3 di
 	return float3(matrix_dot(functionShX, sh), matrix_dot(functionShY, sh), matrix_dot(functionShZ, sh));
 }
 
-float3 sh3UnprojectCosLobe(sh3 functionShX, sh3 functionShY, sh3 functionShZ, float3 dir)
+// float4x4 M = float4x4(
+// 	float4(c1*sh[2][2], c1*sh[1][1], c1*sh[2][1], c2*sh[1][0]),
+// 	float4(c1*sh[1][1], -c1*sh[2][2], c1*sh[1][2], c2*sh[0][1]),
+// 	float4(c1*sh[2][1], c1*sh[1][2], c3*sh[2][0], c2*sh[0][2]),
+// 	float4(c2*sh[1][0], c2*sh[0][1], c2*sh[0][2], c4*sh[0][0] - c5*sh[2][0]),
+// );
+
+float3 sh3UnprojectCosLobe(sh3 ish[3], float3 normal)
 {
-	sh3 sh = sh3TransformCosLobe(dir);
-	return float3(matrix_dot(functionShX, sh), matrix_dot(functionShY, sh), matrix_dot(functionShZ, sh));
+	sh3 sh = sh3TransformCosLobe(normal);
+	return float3(matrix_dot(ish[0], sh), matrix_dot(ish[1], sh), matrix_dot(ish[2], sh));
+	// float c1 = 0.429043f; float c2 = 0.511664f; float c3 = 0.743125f; float c4 = 0.886227f; float c5 =  0.247708f;
+	// float3 radiance;
+
+	// [unroll]
+	// for(int i = 0; i < 3; i++) {
+	// 	sh3 sh = ish[i];
+
+	// 	radiance[i] = c1*sh[2][2]*(normal.x * normal.x - normal.y * normal.y) + c3 * sh[2][0] * normal.z*normal.z + c4 * sh[0][0] - c5 * sh[2][0]
+	// 		+ 2 * c1 * (sh[1][1]*normal.x*normal.y + sh[2][1] * normal.x * normal.z + sh[1][2] * normal.y * normal.z)
+	// 		+ 2 * c2 * (sh[1][0]*normal.x + sh[0][1]*normal.y + sh[0][2]*normal.z);
+	// }
+	// return radiance;
 }
 
 

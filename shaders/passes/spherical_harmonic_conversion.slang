@@ -1,6 +1,7 @@
 #include "spherical_harmonics.slang"
 #include "packing.slang"
 #include "math.slang"
+#include "random.slang"
 
 [[vk::binding(0, 1)]] RWTexture2D<float4> probe_atlas;
 [[vk::binding(0, 0)]] RWStructuredBuffer<float3x3> out;
@@ -8,8 +9,9 @@
 [shader("compute")]
 [numthreads(8,8,1)]
 void main(uint3 threadId : SV_DispatchThreadID, uint2 local_thread_id : SV_GroupThreadID, uint2 work_group_index : SV_GroupID) {
-    float3 local_ray_direction = octa_decode(float2(local_thread_id) / 8.0);
+    float3 local_ray_direction = octa_decode((float2(local_thread_id) + 0.5) / 8.0);
     float3 ray_color = probe_atlas[threadId.xy].xyz;
+
     sh3 sh = sh3Evaluate(local_ray_direction);
 
     sh3 shR = WaveActiveSum(sh3Scale(sh, ray_color.x));

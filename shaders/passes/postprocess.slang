@@ -90,6 +90,10 @@ float3 agxLook(float3 val) {
 [shader("compute")]
 [numthreads(8,8,1)]
 void main(uint3 threadId : SV_DispatchThreadID) {
+    if(any(threadId.xy > gconst.view.viewportSize)) {
+        return;
+    }
+    
     var depth = Depth[threadId.xy];
     float3 color;
     if(depth != BACKGROUND_DEPTH) {

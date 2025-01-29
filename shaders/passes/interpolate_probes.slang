@@ -8,78 +8,97 @@
 [[vk::binding(2, 1)]] RWStructuredBuffer<float3x3> sh_coeficents;
 [[vk::binding(0, 2)]] RWTexture2D<float4> Light;
 
-
 [shader("compute")]
 [numthreads(8,8,1)]
 void main(uint3 threadId : SV_DispatchThreadID) {
-    uint2 pixel_coord = threadId.xy;
-    
-    RandomSamplerState rng = RandomSamplerState(pixel_coord, gconst.frame_index);
+    if(any(threadId.xy > gconst.view.viewportSize)) {
+        return;
+    }
 
+    var pixel_coord = threadId.xy;
     var pixel_depth = gbuffer_depth[pixel_coord];
     if(pixel_depth == BACKGROUND_DEPTH) {
         return;
-    }
+    }    
     
-    uint2 local_probe_coord = uint2(floor(float2(pixel_coord) / 16.0));
+    var rng = RandomSamplerState(pixel_coord, gconst.frame_index);
+    
+    var surface = GbufferDataPacked::from_uint4(gbuffer[pixel_coord]).unpack();
+
+    var pixel_pos = world_pos_from_depth(pixel_depth, pixel_coord, gconst.view);
+    var cell_size = pixel_depth * gconst.cell_size;
+
+    var jitter = int2((2.0 * float2(rng.uniform_float(), rng.uniform_float()) - 1.0) * 16.0);
+    var jitterd_pixel_coord = clamp(int2(pixel_coord) + jitter, 0, int2(gconst.view.viewportSize) - 1);
+    var jitterd_depth = gbuffer_depth[jitterd_pixel_coord];
+    var jitterd_pos = world_pos_from_depth(jitterd_depth, jitterd_pixel_coord, gconst.view);
+    
+    if(abs(dot(jitterd_pos - pixel_pos, surface.normal)) < 0.5f * cell_size) {
+        pixel_coord = jitterd_pixel_coord;
+    }
+
+    var local_probe_coord = uint2(floor(float2(pixel_coord) / 16.0));
+    var local_probe_pixel_coord = local_probe_coord * 16;
     uint2 probe_coords[] = {
         uint2(local_probe_coord.x, local_probe_coord.y), 
-        uint2(local_probe_coord.x + 1, local_probe_coord.y + 1), 
+        uint2(local_probe_coord.x + 1, local_probe_coord.y),
+        uint2(local_probe_coord.x, local_probe_coord.y + 1),
+        uint2(local_probe_coord.x + 1, local_probe_coord.y + 1),
     };
+
+    float4 probe_weights = float4(0.0);
+
+    for (uint i = 0; i < 4; ++i) {
+        var probe_coord = probe_coords[i];
+        var probe_pixel_coord = probe_coord * 16;
+        var probe_depth = gbuffer_depth[probe_pixel_coord];
+
+        if(probe_depth == BACKGROUND_DEPTH || any(probe_coord >= uint2(gconst.view.viewportSize) / 16)) {
+            continue;
+        }
+        
+        var probe_position = world_pos_from_depth(probe_depth, probe_pixel_coord, gconst.view);
+        
+        if (abs(dot(probe_position - pixel_pos, surface.normal)) > cell_size) {
+            probe_weights[i] = 0.0;
+        }else {
+            probe_weights[i] = saturate(1.0 - abs(probe_depth - pixel_depth) / pixel_depth);
+            probe_weights[i] *= max(dot(surface.normal, GbufferDataPacked::from_uint4(gbuffer[probe_pixel_coord]).unpack_normal()), 0.0);
+            probe_weights[i] = pow(probe_weights[i], 8.0);
+        }
+    }
     
-    var pixel_pos = world_pos_from_depth(pixel_depth, pixel_coord, gconst.view);
-    var surface = GbufferDataPacked::from_uint4(gbuffer[pixel_coord]).unpack();
-    DiffuseBrdf brdf = {surface.albedo};  
-    var orth_bias = build_orthonormal_basis(surface.normal);
+    float3 radiance = 0.0;
+    if(dot(probe_weights, probe_weights) == 0.0) {
+        radiance = float3(1.0, 0.0, 0.0); //Interpolation failed
+        Light[pixel_coord] = float4(radiance, 1.0);
+        return;
+    }
 
-    float4 probe_values[4] = {float4(0.0)};
+    probe_weights /= probe_weights.x + probe_weights.y + probe_weights.z + probe_weights.w;
 
-    [unroll]
-    for (int y = 0; y < 2; y++) {
-        [unroll]
-        for (int x = 0; x < 2; x++) {
-            var probe_coord = uint2(probe_coords[x].x, probe_coords[y].y);
 
-            var probe_position = world_pos_from_depth(gbuffer_depth[probe_coord * 16], probe_coord * 16, gconst.view);
-            var to_probe = pixel_pos - probe_position;
-            var probe_weight = 1.0 - abs(dot(surface.normal, to_probe));
-            probe_weight *= fract(probe_coord / 16.0);
-            if(probe_weight < 0.9) {
-                probe_weight = 0;
-            }
-            if(gbuffer_depth[probe_coord * 16] == BACKGROUND_DEPTH || any(probe_coord * 16 > uint2(gconst.view.viewportSize))) {
-                probe_weight = 0;
-            }
-
+    for(uint i = 0; i < 4; ++i) {
+        float3 probe_radiance;
+        var probe_coord = probe_coords[i];
+        if(gconst.proberng == 1) {
+            var probe_pixel_coord = probe_coord * 16;
+            // RandomSamplerState probe_rng = RandomSamplerState(probe_coord, 1);
+            // radiance = float3(probe_rng.uniform_float(), probe_rng.uniform_float(), probe_rng.uniform_float());
+            probe_radiance = (GbufferDataPacked::from_uint4(gbuffer[probe_pixel_coord]).unpack_normal() + 1.0) / 2.0;
+        }else {
             sh3 shR = sh_coeficents[ZCurveToLinearIndex(uint2(probe_coord.x * 3 + 0, probe_coord.y))];
             sh3 shG = sh_coeficents[ZCurveToLinearIndex(uint2(probe_coord.x * 3 + 1, probe_coord.y))];
             sh3 shB = sh_coeficents[ZCurveToLinearIndex(uint2(probe_coord.x * 3 + 2, probe_coord.y))];
             
-            float3 radiance;
-            if(gconst.proberng == 1) {
-                RandomSamplerState probe_rng = RandomSamplerState(probe_coord, 1);
-                radiance = float3(probe_rng.uniform_float(), probe_rng.uniform_float(), probe_rng.uniform_float());
-            }else {
-                radiance = sh3UnprojectCosLobe(shR, shG, shB, surface.normal);   
-            }
-
-            probe_values[y*2+x].xyz = max(0.0, radiance);
-            probe_values[y*2+x].w = probe_weight; 
+            sh3 sh[] = {shR, shG, shB};
+            probe_radiance = sh3UnprojectCosLobe(sh, surface.normal);   
         }
-    }
-  
-    var lerp1 = lerp(probe_values[0].xyz, probe_values[1].xyz, probe_values[1].w / probe_values[0].w);
-    
-    var lerp2 = lerp(probe_values[2].xyz, probe_values[3].xyz, probe_values[3].w / probe_values[2].w);
-
-    var radiance = lerp(lerp1.xyz, lerp2.xyz, (probe_values[3].w + probe_values[2].w) / (probe_values[1].w + probe_values[0].w)); //TODOOOOO
-
-    if((abs(probe_values[0].w) + abs(probe_values[1].w) + abs(probe_values[2].w) + abs(probe_values[3].w)) < 0.001) {
-        radiance = float3(1.0, 0.0, 0.0); //Interpolation failed
+        radiance += probe_weights[i] * max(0.0, probe_radiance);
     }
 
-    radiance *= surface.albedo;
+    radiance *= surface.albedo * FRAC_1_PI;
     radiance += surface.emissive;
 
-    Light[pixel_coord] = select(all(pixel_coord == local_probe_coord*16), float4(1.0, 0.0, 0.0, 0.0), float4(radiance, 1.0));
+    Light[threadId.xy] = float4(radiance, 1.0);
 }

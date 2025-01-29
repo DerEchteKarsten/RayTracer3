@@ -13,7 +13,7 @@ use backend::{
     raytracing::RayTracingContext,
     render_graph::{
         ComputePassBuilder, FrameBuilder, ImageSize, PassBuilder, RayTracingPassBuilder,
-        RenderGraph, SceneResources,
+        RenderGraph, ResourceType, SceneResources,
     },
     utils::{Buffer, Image, ImageResource},
     vulkan_context::Context,
@@ -31,7 +31,7 @@ use winit::{
     window::WindowAttributes,
 };
 
-const WINDOW_SIZE: IVec2 = IVec2::new(1920, 1080);
+const WINDOW_SIZE: IVec2 = IVec2::new(1920, 1088);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -67,7 +67,8 @@ struct GConst {
     pub bounces: u32,
     pub samples: u32,
     pub proberng: u32,
-    pub buffer: [u32; 3]
+    pub cell_size: f32,
+    pub buffer: [u32; 2],
 }
 
 fn main() {
@@ -175,7 +176,9 @@ fn main() {
         vertex_buffer: model.vertex_buffer,
     };
 
-    let mut render_graph = RenderGraph::new(&mut ctx, scene_resources);
+    let mut imgui = ImGui::new(&window);
+
+    let mut render_graph = RenderGraph::new(&mut ctx, scene_resources, &mut imgui);
 
     render_graph.add_image_resource(
         &mut ctx,
@@ -212,6 +215,12 @@ fn main() {
         vk::Format::R32G32B32A32_SFLOAT,
         ImageSize::Viewport,
     );
+    render_graph.add_image_resource(
+        &mut ctx,
+        "TraceDirections",
+        vk::Format::R16_UINT,
+        ImageSize::ViewportFraction { x: 0.5, y: 0.5 },
+    );
 
     let frame = FrameBuilder::default()
         .add_pass(
@@ -226,6 +235,23 @@ fn main() {
             .write("GBufferDepth"),
         )
         .add_pass(
+            PassBuilder::new_compute(
+                "StructuredImportanceSampling",
+                ComputePassBuilder::default()
+                    .shader("structured_importance_sampling.slang.spv")
+                    .dispatch(
+                        (WINDOW_SIZE.x as u32).div_ceil(16),
+                        (WINDOW_SIZE.y as u32).div_ceil(16),
+                        1,
+                    ),
+            )
+            .bindles_descriptor(true)
+            .read_previous("ProbeAtlas")
+            .read("GBuffer")
+            .read("GBufferDepth")
+            .write("TraceDirections"),
+        )
+        .add_pass(
             PassBuilder::new_raytracing(
                 "TraceProbes",
                 RayTracingPassBuilder::default()
@@ -236,14 +262,19 @@ fn main() {
             .write("ProbeAtlas")
             .read_previous("ProbeAtlas")
             .read("GBuffer")
-            .read("GBufferDepth"),
+            .read("GBufferDepth")
+            .read("TraceDirections"),
         )
         .add_pass(
             PassBuilder::new_compute(
                 "SphericalHarmonics",
                 ComputePassBuilder::default()
                     .shader("spherical_harmonic_conversion.slang.spv")
-                    .dispatch((WINDOW_SIZE.x as u32).div_ceil(16), (WINDOW_SIZE.y as u32).div_ceil(16), 1),
+                    .dispatch(
+                        (WINDOW_SIZE.x as u32).div_ceil(16),
+                        (WINDOW_SIZE.y as u32).div_ceil(16),
+                        1,
+                    ),
             )
             .write("SphericalHarmonics")
             .read("ProbeAtlas"),
@@ -261,19 +292,20 @@ fn main() {
             .read("SphericalHarmonics")
             .write("Light"),
         )
-        // .add_pass(
-        //     PassBuilder::new_raytracing(
-        //         "Refrence",
-        //         RayTracingPassBuilder::default()
-        //             .raygen_shader("refrence_mode.slang.spv")
-        //             .launch_fullscreen(),
-        //     )
-        //     .bindles_descriptor(true)
-        //     .read("GBuffer")
-        //     .read("GBufferDepth")
-        //     .read_previous("Light")
-        //     .write("Light"),
-        // )
+        .add_pass(
+            PassBuilder::new_raytracing(
+                "RefrenceMode",
+                RayTracingPassBuilder::default()
+                    .raygen_shader("refrence_mode.slang.spv")
+                    .launch_fullscreen(),
+            )
+            .bindles_descriptor(true)
+            .read("GBuffer")
+            .read("GBufferDepth")
+            .read_previous("Light")
+            .write("Light")
+            .toggle_active(false),
+        )
         .add_pass(
             PassBuilder::new_compute(
                 "Postprocess",
@@ -289,7 +321,6 @@ fn main() {
         .set_back_buffer_source("Out");
 
     render_graph.compile(frame, &mut ctx, &raytracing_ctx);
-    let mut imgui = ImGui::new(&ctx, &render_graph, &window);
 
     let mut controles = Controls {
         ..Default::default()
@@ -308,9 +339,10 @@ fn main() {
     gconst.blendfactor = 1.0;
     gconst.samples = 1;
     gconst.bounces = 4;
+    gconst.cell_size = f32::tan(camera.fov * 16.0 * f32::max(1.0 / WINDOW_SIZE.y as f32, WINDOW_SIZE.y as f32 / (WINDOW_SIZE.x as f32 * WINDOW_SIZE.x as f32)));
     let mut frame_time = Duration::default();
     let mut last_time = Instant::now();
-    let mut show_atlas = false;
+    let mut refrence_mode = false;
 
     #[allow(clippy::collapsible_match, clippy::single_match, deprecated)]
     event_loop
@@ -346,37 +378,54 @@ fn main() {
                         gconst.planar_view_constants = camera.planar_view_constants();
                         gconst.frame = render_graph.frame_number.try_into().unwrap_or(0);
                         render_graph.update_uniform(&gconst);
-                        if show_atlas {
-                            render_graph.back_buffer = "ProbeAtlas".to_string();
-                        }else {
-                            render_graph.back_buffer = "Out".to_string();
-                        }
-                        render_graph.draw(&ctx, &raytracing_ctx, &mut imgui, &window, |ui| {
-                            ui.window("Constants Editor")
-                                .size([300.0, WINDOW_SIZE.y as f32], Condition::FirstUseEver)
-                                .position([0.0, 0.0], Condition::FirstUseEver)
-                                .build(|| {
-                                    ui.text(format!(
-                                        "FPS: {:.0}, {:?}",
-                                        1000.0 / frame_time.as_millis() as f64,
-                                        frame_time
-                                    ));
-                                    ui.slider(
-                                        "Blendfactor",
-                                        0.0,
-                                        1.0,
-                                        &mut gconst.blendfactor,
+
+                        let ui = imgui.context.frame();
+                        ui.window("Constants Editor")
+                            .size([300.0, WINDOW_SIZE.y as f32], Condition::FirstUseEver)
+                            .position([0.0, 0.0], Condition::FirstUseEver)
+                            .build(|| {
+                                ui.text(format!(
+                                    "FPS: {:.0}, {:?}",
+                                    1000.0 / frame_time.as_millis() as f64,
+                                    frame_time
+                                ));
+                                ui.slider("Blendfactor", 0.0, 1.0, &mut gconst.blendfactor);
+                                ui.input_scalar("Samples", &mut gconst.samples)
+                                    .step(1)
+                                    .build();
+                                ui.input_scalar("Bounces", &mut gconst.bounces)
+                                    .step(1)
+                                    .build();
+                                ui.checkbox_flags("ProbeRng", &mut gconst.proberng, 0x1);
+
+                                if let Some(token) =
+                                    ui.begin_combo("Backbuffer", render_graph.back_buffer.as_str())
+                                {
+                                    for (i, res) in &render_graph.resources {
+                                        if res.ty == ResourceType::Image
+                                            && ui.selectable(i.as_str())
+                                        {
+                                            render_graph.back_buffer = i.clone();
+                                        }
+                                    }
+                                    token.end();
+                                }
+
+                                if ui.checkbox("Refrence Mode", &mut refrence_mode) {
+                                    render_graph.toggle_pass("RefrenceMode", refrence_mode);
+                                    render_graph.toggle_pass("InterpolateProbes", !refrence_mode);
+                                    render_graph.toggle_pass("SphericalHarmonics", !refrence_mode);
+                                    render_graph.toggle_pass("TraceProbes", !refrence_mode);
+                                    render_graph.toggle_pass(
+                                        "StructuredImportanceSampling",
+                                        !refrence_mode,
                                     );
-                                    ui.input_scalar("Samples", &mut gconst.samples)
-                                        .step(1)
-                                        .build();
-                                    ui.input_scalar("Bounces", &mut gconst.bounces)
-                                        .step(1)
-                                        .build();
-                                    ui.checkbox_flags("ProbeRng", &mut gconst.proberng, 0x1);
-                                    ui.checkbox("Show Atlas", &mut show_atlas)
-                                });
-                        });
+                                }
+                            });
+                        imgui.platform.prepare_render(ui, &window);
+                        let draw_data = imgui.context.render();
+
+                        render_graph.draw(&ctx, &raytracing_ctx, draw_data);
                     }
                     _ => (),
                 },

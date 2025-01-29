@@ -88,8 +88,22 @@ impl Image {
                 other.image,
                 dst_layout,
                 &[vk::ImageBlit::default()
-                    .src_offsets([vk::Offset3D::default(), vk::Offset3D { x: self.extent.width as _, y: self.extent.height as _, z: 1 }])
-                    .dst_offsets([vk::Offset3D::default(), vk::Offset3D { x: other.extent.width as _, y: other.extent.height as _, z: 1 }])
+                    .src_offsets([
+                        vk::Offset3D::default(),
+                        vk::Offset3D {
+                            x: self.extent.width as _,
+                            y: self.extent.height as _,
+                            z: 1,
+                        },
+                    ])
+                    .dst_offsets([
+                        vk::Offset3D::default(),
+                        vk::Offset3D {
+                            x: other.extent.width as _,
+                            y: other.extent.height as _,
+                            z: 1,
+                        },
+                    ])
                     .src_subresource(vk::ImageSubresourceLayers {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
                         mip_level: 0,

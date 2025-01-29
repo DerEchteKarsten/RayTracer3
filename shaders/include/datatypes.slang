@@ -52,7 +52,8 @@ struct GConst {
     uint samples;
 
     uint proberng;
-    uint3 pad;
+    float cell_size;
+    uint2 pad;
 };
 
 struct RayPayload {

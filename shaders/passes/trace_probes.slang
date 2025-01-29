@@ -7,6 +7,7 @@
 
 [[vk::binding(0, 1)]] RWTexture2D<uint4> gbuffer;
 [[vk::binding(1, 1)]] RWTexture2D<float> gbuffer_depth;
+[[vk::binding(2, 1)]] RWTexture2D<uint16_t> directions;
 [[vk::binding(0, 2)]] RWTexture2D<float4> probe_atlas;
 [[vk::binding(0, 3)]] RWTexture2D<float4> prev_probe_atlas;
 
@@ -15,11 +16,11 @@ void main() {
     RayPayload payload;
     var probe_atlas_index = DispatchRaysIndex().xy;
     uint2 probe_coord = probe_atlas_index / 8;
-    var frame_rng = RandomSamplerState(0, gconst.frame_index);
+    
     var probe_rng = RandomSamplerState(probe_coord, gconst.frame_index);
     var ray_rng = RandomSamplerState(probe_atlas_index, gconst.frame_index);
 
-    uint2 pixel_coord = probe_coord * 16; //+ uint2(float2(frame_rng.uniform_float(), frame_rng.uniform_float()) * uint2(16, 16));
+    uint2 pixel_coord = probe_coord * 16;
 
     var gbuffer_depth = gbuffer_depth[pixel_coord];
     if(gbuffer_depth == BACKGROUND_DEPTH) {
@@ -29,9 +30,16 @@ void main() {
 
 
     var gbuffer_data = GbufferDataPacked::from_uint4(gbuffer[pixel_coord]).unpack();
-    DiffuseBrdf primary_brdf = {gbuffer_data.albedo}; 
+    DiffuseBrdf primary_brdf = {gbuffer_data.albedo};  
 
     uint2 ray_probe_index = probe_atlas_index % 8;
+    uint16_t direction = directions[probe_atlas_index];
+    uint direction_index = direction & 0b0011111111111111;
+    uint mip = direction & 0b1100000000000000;
+    uint size = (1u << mip);
+    var direction_2d = float2(floor(direction_index / size), direction_index % size);
+
+    // var ray_probe_direction = octa_decode((direction_2d + float2(ray_rng.uniform_float(), ray_rng.uniform_float())) / float(size)); 
     var ray_probe_direction = octa_decode((float2(ray_probe_index) + float2(ray_rng.uniform_float(), ray_rng.uniform_float())) / 8.0);
 
     var tangend = build_orthonormal_basis(gbuffer_data.normal);
@@ -39,7 +47,7 @@ void main() {
     RayDesc ray;
     ray.Origin = world_pos_from_depth(gbuffer_depth, pixel_coord, gconst.view);
     ray.Direction = ray_probe_direction;
-    ray.TMin = 0.01;
+    ray.TMin = 0.0005;
     ray.TMax = BACKGROUND_DEPTH;
     
     trace(ray, payload);

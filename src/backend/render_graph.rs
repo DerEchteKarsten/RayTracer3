@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::Result;
-use ash::vk;
+use ash::vk::{self, ImageLayout};
 use gltf::json::extensions::image::Image;
 use gpu_allocator::{
     vulkan::{Allocator, AllocatorCreateDesc},
@@ -33,7 +33,8 @@ use super::{
 
 pub const FRAMES_IN_FLIGHT: u64 = 3;
 
-enum ResourceType {
+#[derive(PartialEq, Eq)]
+pub enum ResourceType {
     Buffer,
     Image,
 }
@@ -54,8 +55,8 @@ impl Default for ResourceData {
     }
 }
 
-struct Resource {
-    ty: ResourceType,
+pub struct Resource {
+    pub ty: ResourceType,
     handle: ResourceTemporal,
 }
 
@@ -83,14 +84,21 @@ pub struct SceneResources {
     pub(crate) skybox_sampler: vk::Sampler,
 }
 
+struct ImguiResources {
+    renderpass: vk::RenderPass,
+    frame_buffers: Vec<vk::Framebuffer>,
+    renderer: imgui_rs_vulkan_renderer::Renderer,
+}
+
 pub struct StaticResources {
-    pub swapchain: Swapchain,
+    swapchain: Swapchain,
+    imgui_resources: ImguiResources,
     scene: SceneResources,
     frame_timeline_semaphore: vk::Semaphore,
 }
 
 impl StaticResources {
-    fn new(ctx: &Context, scene: SceneResources) -> Result<Self> {
+    fn new(ctx: &Context, scene: SceneResources, imgui: &mut ImGui) -> Result<Self> {
         let swapchain = Swapchain::new(&ctx)?;
 
         let mut timeline_create_info = vk::SemaphoreTypeCreateInfo::default()
@@ -101,10 +109,68 @@ impl StaticResources {
         let frame_timeline_semaphore =
             unsafe { ctx.device.create_semaphore(&create_info, None).unwrap() };
 
+        let attachments = [vk::AttachmentDescription::default()
+            .initial_layout(ImageLayout::PRESENT_SRC_KHR)
+            .final_layout(ImageLayout::PRESENT_SRC_KHR)
+            .format(swapchain.format)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .samples(vk::SampleCountFlags::TYPE_1)];
+        let attachment = [vk::AttachmentReference::default()
+            .attachment(0)
+            .layout(ImageLayout::GENERAL)];
+        let subpasses = [vk::SubpassDescription::default()
+            .color_attachments(&attachment)
+            .input_attachments(&[])];
+
+        let render_pass_create_info = vk::RenderPassCreateInfo::default()
+            .attachments(&attachments)
+            .subpasses(&subpasses);
+
+        let renderpass = unsafe {
+            ctx.device
+                .create_render_pass(&render_pass_create_info, None)
+                .unwrap()
+        };
+
+        let mut frame_buffers = Vec::new();
+
+        for (i, image) in swapchain.images.iter().enumerate() {
+            let attachment = [image.view];
+            let frame_buffer_info = vk::FramebufferCreateInfo::default()
+                .attachments(&attachment)
+                .height(WINDOW_SIZE.y as u32)
+                .width(WINDOW_SIZE.x as u32)
+                .layers(1)
+                .render_pass(renderpass);
+            frame_buffers.push(unsafe {
+                ctx.device
+                    .create_framebuffer(&frame_buffer_info, None)
+                    .unwrap()
+            })
+        }
+
+        let renderer = imgui_rs_vulkan_renderer::Renderer::with_default_allocator(
+            &ctx.instance,
+            ctx.physical_device.handel,
+            ctx.device.clone(),
+            ctx.graphics_queue,
+            ctx.command_pool,
+            renderpass,
+            &mut imgui.context,
+            None,
+        )
+        .unwrap();
+
         Ok(Self {
             swapchain,
             scene,
             frame_timeline_semaphore,
+            imgui_resources: ImguiResources {
+                frame_buffers,
+                renderpass,
+                renderer,
+            },
         })
     }
 }
@@ -127,6 +193,11 @@ enum RenderPassCommand {
     Custom(Box<dyn Fn(&vk::CommandBuffer, &RenderPass) -> ()>),
 }
 
+enum RenderPassType {
+    Compute,
+    Raytracing,
+}
+
 struct RenderPass {
     command: RenderPassCommand,
     pipeline: vk::Pipeline,
@@ -135,8 +206,12 @@ struct RenderPass {
     descriptor_set: Option<vk::DescriptorSet>,
     temporal_descriptor_sets: Option<[vk::DescriptorSet; 2]>,
     temporal_descriptor_sets2: Option<[vk::DescriptorSet; 2]>,
+    input_resources: Vec<String>,
+    output_resources: Vec<String>,
     sync_resources: Vec<ResourceSync>,
     name: String,
+    active: bool,
+    ty: RenderPassType,
 }
 
 struct ResourceSync {
@@ -147,7 +222,7 @@ struct ResourceSync {
 }
 
 pub struct RenderGraph {
-    resources: HashMap<String, Resource>,
+    pub resources: HashMap<String, Resource>,
     pub static_resources: StaticResources,
     passes: Vec<RenderPass>,
     pub back_buffer: String,
@@ -184,8 +259,12 @@ impl RenderGraph {
         self.static_resources.swapchain.images.len() as u32
     }
 
-    pub fn new(ctx: &mut Context, scene_resources: SceneResources) -> RenderGraph {
-        let static_resources = StaticResources::new(&ctx, scene_resources).unwrap();
+    pub fn new(
+        ctx: &mut Context,
+        scene_resources: SceneResources,
+        imgui: &mut ImGui,
+    ) -> RenderGraph {
+        let static_resources = StaticResources::new(&ctx, scene_resources, imgui).unwrap();
         let static_bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -420,6 +499,40 @@ impl RenderGraph {
             .unwrap();
     }
 
+    fn build_sync_resources(&mut self) {
+        let mut wirten_resources: HashSet<&str> = HashSet::new();
+        let mut last_writes: HashMap<&str, vk::PipelineStageFlags2> = HashMap::new();
+
+        for pass in &mut self.passes {
+            let mut sync_resources = Vec::new();
+            for i in pass.input_resources.iter() {
+                if wirten_resources.contains(i.as_str()) {
+                    sync_resources.push(ResourceSync {
+                        last_write: last_writes[i.as_str()],
+                        new_layout: None, //TODO
+                        old_layout: None, //TODO
+                        resource_key: i.clone(),
+                    });
+                    wirten_resources.remove(i.as_str());
+                }
+            }
+
+            for i in &pass.output_resources {
+                wirten_resources.insert(i.as_str());
+                last_writes.insert(
+                    i.as_str(),
+                    match pass.ty {
+                        RenderPassType::Compute => vk::PipelineStageFlags2::COMPUTE_SHADER,
+                        RenderPassType::Raytracing => {
+                            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
+                        }
+                    },
+                );
+            }
+            pass.sync_resources = sync_resources;
+        }
+    }
+
     pub fn add_image_resource(
         &mut self,
         ctx: &mut Context,
@@ -431,8 +544,8 @@ impl RenderGraph {
             ImageSize::Custom { x, y } => (x, y),
             ImageSize::Viewport => (WINDOW_SIZE.x as u32, WINDOW_SIZE.y as u32),
             ImageSize::ViewportFraction { x, y } => (
-                (WINDOW_SIZE.x as f32 * x) as u32,
-                (WINDOW_SIZE.y as f32 * y) as u32,
+                (WINDOW_SIZE.x as f32 * x).ceil() as u32,
+                (WINDOW_SIZE.y as f32 * y).ceil() as u32,
             ),
         };
         let image = ImageResource::new_2d(
@@ -468,13 +581,14 @@ impl RenderGraph {
         );
     }
 
-    pub fn add_buffer_resource(
-        &mut self,
-        ctx: &mut Context,
-        name: &str,
-        size: u64,
-    ) {
-        let buffer = Buffer::new(ctx, vk::BufferUsageFlags::STORAGE_BUFFER, gpu_allocator::MemoryLocation::GpuOnly, size).unwrap();
+    pub fn add_buffer_resource(&mut self, ctx: &mut Context, name: &str, size: u64) {
+        let buffer = Buffer::new(
+            ctx,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            gpu_allocator::MemoryLocation::GpuOnly,
+            size,
+        )
+        .unwrap();
 
         let label = vk::DebugUtilsObjectNameInfoEXT::default()
             .object_handle(buffer.buffer)
@@ -560,14 +674,14 @@ impl RenderGraph {
                 .chain(pass.output_resources.iter())
             {
                 if matches!(
-                    self.resources[*resource].handle,
+                    self.resources[resource].handle,
                     ResourceTemporal::Temporal(_)
                 ) {
                     descriptors_needed |= 0x2
                 } else {
                     descriptors_needed |= 0x1
                 }
-                match self.resources[*resource].ty {
+                match self.resources[resource].ty {
                     ResourceType::Buffer => pool_sizes
                         .entry(vk::DescriptorType::STORAGE_BUFFER)
                         .and_modify(|e| *e += descriptors_needed)
@@ -581,7 +695,7 @@ impl RenderGraph {
             if !pass.temporal_resources.is_empty() {
                 descriptors_needed += 2;
                 for resource in pass.temporal_resources.iter() {
-                    match self.resources[*resource].ty {
+                    match self.resources[resource].ty {
                         ResourceType::Buffer => pool_sizes
                             .entry(vk::DescriptorType::STORAGE_BUFFER)
                             .and_modify(|e| *e += 2)
@@ -615,36 +729,7 @@ impl RenderGraph {
             None
         };
 
-        let mut wirten_resources: HashSet<&str> = HashSet::new();
-        let mut last_writes: HashMap<&str, vk::PipelineStageFlags2> = HashMap::new();
-
         for pass in &frame.passes {
-            let mut sync_resources = Vec::new();
-            for i in pass.input_resources.iter() {
-                if wirten_resources.contains(i) {
-                    sync_resources.push(ResourceSync {
-                        last_write: last_writes[*i],
-                        new_layout: None, //TODO
-                        old_layout: None, //TODO
-                        resource_key: (*i).to_owned(),
-                    });
-                    wirten_resources.remove(i);
-                }
-            }
-
-            for i in &pass.output_resources {
-                wirten_resources.insert(*i);
-                last_writes.insert(
-                    i,
-                    match pass.ty {
-                        PassBuilderType::Compute(_) => vk::PipelineStageFlags2::COMPUTE_SHADER,
-                        PassBuilderType::Raytracing(_) => {
-                            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
-                        }
-                    },
-                );
-            }
-
             let mut layouts = Vec::new();
             if pass.bindless_descriptor {
                 layouts.push(self.static_descriptor_set_layout);
@@ -655,32 +740,32 @@ impl RenderGraph {
             let mut temporal_previous_descriptor = Vec::new();
 
             for res in pass.input_resources.iter() {
-                let resource = &self.resources[*res];
+                let resource = &self.resources[res];
                 if matches!(resource.handle, ResourceTemporal::Single(_)) {
-                    if !static_descriptor.contains(res) {
+                    if !static_descriptor.contains(&res.as_str()) {
                         static_descriptor.push(res);
                     }
                 } else {
-                    if !current_temporal_descriptor.contains(res) {
+                    if !current_temporal_descriptor.contains(&res.as_str()) {
                         current_temporal_descriptor.push(res);
                     }
                 }
             }
 
             for (i, res) in pass.temporal_resources.iter().enumerate() {
-                if !temporal_previous_descriptor.contains(res) {
+                if !temporal_previous_descriptor.contains(&res.as_str()) {
                     temporal_previous_descriptor.push(res);
                 }
             }
 
             for (i, res) in pass.output_resources.iter().enumerate() {
-                let resource = &self.resources[*res];
+                let resource = &self.resources[res];
                 if matches!(resource.handle, ResourceTemporal::Single(_)) {
-                    if !static_descriptor.contains(res) {
+                    if !static_descriptor.contains(&res.as_str()) {
                         static_descriptor.push(res);
                     }
                 } else {
-                    if !current_temporal_descriptor.contains(res) {
+                    if !current_temporal_descriptor.contains(&res.as_str()) {
                         current_temporal_descriptor.push(res);
                     }
                 }
@@ -1022,6 +1107,9 @@ impl RenderGraph {
                 }
             }
 
+            let mut input_resources = pass.input_resources.clone();
+            input_resources.append(&mut pass.temporal_resources.clone());
+
             let compiled_pass = RenderPass {
                 command,
                 descriptor_set: if !static_bindings.is_empty() {
@@ -1031,7 +1119,7 @@ impl RenderGraph {
                 },
                 layout,
                 pipeline,
-                sync_resources,
+                sync_resources: vec![],
                 temporal_descriptor_sets: if !static_temporal_bindings.is_empty() {
                     Some([
                         descriptor_sets[static_temporal_offset],
@@ -1050,24 +1138,21 @@ impl RenderGraph {
                 },
                 bindless_descriptor: pass.bindless_descriptor,
                 name: pass.name.clone(),
+                active: pass.active,
+                input_resources,
+                output_resources: pass.output_resources.clone(),
+                ty: match pass.ty {
+                    PassBuilderType::Compute(_) => RenderPassType::Compute,
+                    PassBuilderType::Raytracing(_) => RenderPassType::Raytracing,
+                },
             };
             self.passes.push(compiled_pass);
         }
+        self.build_sync_resources();
         self.back_buffer = frame.back_buffer;
     }
-    //TODO Error Handeling
-    pub fn draw<F>(
-        &mut self,
-        ctx: &Context,
-        raytracing_ctx: &RayTracingContext,
-        imgui: &mut ImGui,
-        window: &winit::window::Window,
-        uibuilder: F,
-    ) where
-        F: FnOnce(&imgui::Ui),
-    {
-        let frame_in_flight = self.frame_number % FRAMES_IN_FLIGHT;
 
+    fn begin_frame(&self, ctx: &Context, frame_in_flight: u64) -> u32 {
         let frame = &self.frame_data[frame_in_flight as usize];
         let semaphore = [self.static_resources.frame_timeline_semaphore];
         let values = [frame.frame_number];
@@ -1090,7 +1175,7 @@ impl RenderGraph {
                 .unwrap()
         };
 
-        let swapchain_image_index = unsafe {
+        unsafe {
             self.static_resources
                 .swapchain
                 .ash_swapchain
@@ -1103,10 +1188,22 @@ impl RenderGraph {
                 )
                 .unwrap()
         }
-        .0;
+        .0
+    }
 
+    fn execute_passes(
+        &self,
+        ctx: &Context,
+        raytracing_ctx: &RayTracingContext,
+        frame_in_flight: u64,
+        swapchain_image_index: u32,
+    ) {
+        let frame = &self.frame_data[frame_in_flight as usize];
         unsafe {
             for pass in &self.passes {
+                if !pass.active {
+                    continue;
+                }
                 let bind_point = match pass.command {
                     RenderPassCommand::Compute { .. }
                     | RenderPassCommand::ComputeIndirect { .. } => {
@@ -1326,23 +1423,28 @@ impl RenderGraph {
                     .cmd_pipeline_barrier2(frame.cmd, &dependency_info);
             };
 
-            match &self.resources[&self.back_buffer].handle {
-                ResourceTemporal::Single(res) => match res {
-                    ResourceData::Buffer(_) => {
-                        panic!("Back Buffer is Buffer")
-                    }
-                    ResourceData::Image(image) => copy_image(image),
-                },
-                ResourceTemporal::Temporal(res) => match &res[(self.frame_number % 2) as usize] {
-                    ResourceData::Buffer(_) => {
-                        panic!("Back Buffer is Buffer")
-                    }
-                    ResourceData::Image(image) => copy_image(image),
-                },
+            if let Some(entry) = self.resources.get(&self.back_buffer) {
+                match &entry.handle {
+                    ResourceTemporal::Single(res) => match res {
+                        ResourceData::Buffer(_) => {
+                            panic!("Back Buffer is Buffer")
+                        }
+                        ResourceData::Image(image) => copy_image(image),
+                    },
+                    ResourceTemporal::Temporal(res) => match &res[(self.frame_number % 2) as usize]
+                    {
+                        ResourceData::Buffer(_) => {
+                            panic!("Back Buffer is Buffer")
+                        }
+                        ResourceData::Image(image) => copy_image(image),
+                    },
+                }
             }
         }
+    }
 
-        imgui.render(window, ctx, &frame.cmd, swapchain_image_index, uibuilder);
+    fn submit_frame(&mut self, ctx: &Context, frame_in_flight: u64, swapchain_image_index: u32) {
+        let frame = &mut self.frame_data[frame_in_flight as usize];
 
         unsafe { ctx.device.end_command_buffer(frame.cmd).unwrap() };
 
@@ -1354,7 +1456,6 @@ impl RenderGraph {
             .stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)];
 
         let signal_frame_value = frame.frame_number + FRAMES_IN_FLIGHT;
-        let frame = &mut self.frame_data[frame_in_flight as usize];
         frame.frame_number = signal_frame_value;
 
         let signal_semaphores = [
@@ -1402,6 +1503,68 @@ impl RenderGraph {
         };
         self.frame_number += 1;
     }
+
+    fn render_imgui(
+        &mut self,
+        ctx: &Context,
+        draw_data: &imgui::DrawData,
+        cmd: vk::CommandBuffer,
+        swapchain_image_index: u32,
+    ) {
+        unsafe {
+            let begin_info = vk::RenderPassBeginInfo::default()
+                .framebuffer(
+                    self.static_resources.imgui_resources.frame_buffers
+                        [swapchain_image_index as usize],
+                )
+                .render_pass(self.static_resources.imgui_resources.renderpass)
+                .render_area(
+                    vk::Rect2D::default()
+                        .extent(vk::Extent2D {
+                            width: WINDOW_SIZE.x as u32,
+                            height: WINDOW_SIZE.y as u32,
+                        })
+                        .offset(vk::Offset2D { x: 0, y: 0 }),
+                );
+            ctx.device
+                .cmd_begin_render_pass(cmd, &begin_info, vk::SubpassContents::INLINE);
+            self.static_resources
+                .imgui_resources
+                .renderer
+                .cmd_draw(cmd, draw_data)
+                .unwrap();
+            ctx.device.cmd_end_render_pass(cmd);
+        }
+    }
+
+    //TODO Error Handeling
+    pub fn draw(
+        &mut self,
+        ctx: &Context,
+        raytracing_ctx: &RayTracingContext,
+        draw_data: &imgui::DrawData,
+    ) {
+        let frame_in_flight = self.frame_number % FRAMES_IN_FLIGHT;
+        let swapchain_image_index = self.begin_frame(ctx, frame_in_flight);
+
+        self.execute_passes(ctx, raytracing_ctx, frame_in_flight, swapchain_image_index);
+        self.render_imgui(
+            ctx,
+            draw_data,
+            self.frame_data[frame_in_flight as usize].cmd,
+            swapchain_image_index,
+        );
+        self.submit_frame(ctx, frame_in_flight, swapchain_image_index);
+    }
+
+    pub fn toggle_pass(&mut self, pass: &str, value: bool) {
+        self.passes
+            .iter_mut()
+            .find(|e| e.name == pass)
+            .unwrap()
+            .active = value;
+        self.build_sync_resources();
+    }
 }
 
 #[derive(Default)]
@@ -1422,11 +1585,12 @@ impl<'b> FrameBuilder<'b> {
 }
 
 pub struct PassBuilder<'a> {
-    input_resources: Vec<&'a str>,
-    temporal_resources: Vec<&'a str>,
-    output_resources: Vec<&'a str>,
+    input_resources: Vec<String>,
+    temporal_resources: Vec<String>,
+    output_resources: Vec<String>,
     bindless_descriptor: bool,
     name: String,
+    active: bool,
     ty: PassBuilderType<'a>,
 }
 
@@ -1437,30 +1601,35 @@ enum PassBuilderType<'a> {
 
 impl<'b> PassBuilder<'b> {
     pub fn read(mut self, value: &'b str) -> Self {
-        if self.input_resources.contains(&value) {
+        if self.input_resources.contains(&value.to_owned()) {
             panic!("Resource already in input resources")
         }
-        self.input_resources.push(value);
+        self.input_resources.push(value.to_owned());
         self
     }
     pub fn read_previous(mut self, value: &'b str) -> Self {
-        if self.temporal_resources.contains(&value) {
+        if self.temporal_resources.contains(&value.to_owned()) {
             panic!("Resource already in temporal resources")
         }
-        self.temporal_resources.push(value);
+        self.temporal_resources.push(value.to_owned());
         self
     }
     pub fn write(mut self, value: &'b str) -> Self {
-        if self.output_resources.contains(&value) {
+        if self.output_resources.contains(&value.to_owned()) {
             panic!("Resource already in output resources")
         }
-        self.output_resources.push(value);
+        self.output_resources.push(value.to_owned());
         self
     }
     pub fn bindles_descriptor(mut self, value: bool) -> Self {
         self.bindless_descriptor = value;
         self
     }
+    pub fn toggle_active(mut self, value: bool) -> Self {
+        self.active = value;
+        self
+    }
+
     pub fn new_compute(name: &str, builder: ComputePassBuilder<'b>) -> Self {
         Self {
             ty: PassBuilderType::Compute(builder),
@@ -1469,6 +1638,7 @@ impl<'b> PassBuilder<'b> {
             output_resources: Vec::new(),
             temporal_resources: Vec::new(),
             name: name.to_owned(),
+            active: true,
         }
     }
     pub fn new_raytracing(name: &str, builder: RayTracingPassBuilder<'b>) -> Self {
@@ -1479,6 +1649,7 @@ impl<'b> PassBuilder<'b> {
             output_resources: Vec::new(),
             temporal_resources: Vec::new(),
             name: name.to_owned(),
+            active: true,
         }
     }
 }
