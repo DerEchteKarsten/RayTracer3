@@ -9,7 +9,10 @@
 [shader("compute")]
 [numthreads(8,8,1)]
 void main(uint3 threadId : SV_DispatchThreadID, uint2 local_thread_id : SV_GroupThreadID, uint2 work_group_index : SV_GroupID) {
-    float3 local_ray_direction = octa_decode((float2(local_thread_id) + 0.5) / 8.0);
+    var direction_index = local_thread_id.y * 8 + local_thread_id.x;
+    var direction_2d = float2(uint(direction_index / 8), direction_index % 8);
+    float3 local_ray_direction = octa_decode((direction_2d + 0.5) / 8.0);
+
     float3 ray_color = probe_atlas[threadId.xy].xyz;
 
     sh3 sh = sh3Evaluate(local_ray_direction);

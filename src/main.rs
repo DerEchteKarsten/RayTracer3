@@ -222,6 +222,14 @@ fn main() {
         ImageSize::ViewportFraction { x: 0.5, y: 0.5 },
     );
 
+    render_graph.add_image_resource(
+        &mut ctx,
+        "DebugPDFs",
+        vk::Format::R32_SFLOAT,
+        ImageSize::ViewportFraction { x: 0.5, y: 0.5 },
+    );
+
+
     let frame = FrameBuilder::default()
         .add_pass(
             PassBuilder::new_raytracing(
@@ -249,7 +257,8 @@ fn main() {
             .read_previous("ProbeAtlas")
             .read("GBuffer")
             .read("GBufferDepth")
-            .write("TraceDirections"),
+            .write("TraceDirections")
+            .write("DebugPDFs"),
         )
         .add_pass(
             PassBuilder::new_raytracing(

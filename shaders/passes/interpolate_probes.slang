@@ -33,7 +33,7 @@ void main(uint3 threadId : SV_DispatchThreadID) {
     var jitterd_depth = gbuffer_depth[jitterd_pixel_coord];
     var jitterd_pos = world_pos_from_depth(jitterd_depth, jitterd_pixel_coord, gconst.view);
     
-    if(abs(dot(jitterd_pos - pixel_pos, surface.normal)) < 0.5f * cell_size) {
+    if(abs(dot(normalize(jitterd_pos - pixel_pos), surface.normal)) < 0.01) {//0.5f * cell_size) {
         pixel_coord = jitterd_pixel_coord;
     }
 

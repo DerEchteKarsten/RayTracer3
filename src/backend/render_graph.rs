@@ -1063,7 +1063,7 @@ impl RenderGraph {
                 }
             }
             if !temporal_bindings.is_empty() {
-                for (binding, resource) in current_temporal_resources.iter().enumerate() {
+                for (binding, resource) in temporal_previous_resources.iter().enumerate() {
                     match &resource.handle {
                         ResourceTemporal::Temporal(resource) => {
                             for i in 0..2 {

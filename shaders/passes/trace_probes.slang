@@ -35,12 +35,12 @@ void main() {
     uint2 ray_probe_index = probe_atlas_index % 8;
     uint16_t direction = directions[probe_atlas_index];
     uint direction_index = direction & 0b0011111111111111;
-    uint mip = direction & 0b1100000000000000;
-    uint size = (1u << mip);
-    var direction_2d = float2(floor(direction_index / size), direction_index % size);
+    uint mip = (direction & 0b1100000000000000) >> 14;
+    uint size = (1 << mip) * 8;
+    var direction_2d = float2(uint(direction_index / size), direction_index % size);
 
-    // var ray_probe_direction = octa_decode((direction_2d + float2(ray_rng.uniform_float(), ray_rng.uniform_float())) / float(size)); 
-    var ray_probe_direction = octa_decode((float2(ray_probe_index) + float2(ray_rng.uniform_float(), ray_rng.uniform_float())) / 8.0);
+    var ray_probe_direction = octa_decode((direction_2d + float2(ray_rng.uniform_float(), ray_rng.uniform_float())) / float(size)); 
+    // var ray_probe_direction = octa_decode((float2(ray_probe_index) + float2(ray_rng.uniform_float(), ray_rng.uniform_float())) / 8.0);
 
     var tangend = build_orthonormal_basis(gbuffer_data.normal);
 
