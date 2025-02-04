@@ -122,8 +122,8 @@ float luminance(float3 color)
     return dot(color.xyz, float3(0.299f, 0.587f, 0.114f));
 }
 
-void sort<T: IComparable>(uint i, inout T array[]) {
-    for(uint k = 2; k <= 32; k *= 2) {
+void sort<T: IComparable>(uint i, uint array_length, inout T array[]) {
+    for(uint k = 2; k <= array_length; k *= 2) {
         for (uint j = k/2; j > 0; j /= 2){
             int l = i ^ j;
             if(l>i) {
@@ -132,6 +132,27 @@ void sort<T: IComparable>(uint i, inout T array[]) {
                         var temp = array[i];
                         array[i] = array[l];
                         array[l] = temp;
+                    }
+            } 
+            GroupMemoryBarrierWithGroupSync();
+        }
+    }
+}
+
+void sort<T: IComparable>(uint i, uint array_length, inout T array[], inout uint indecies[]) {
+    for(uint k = 2; k <= array_length; k *= 2) {
+        for (uint j = k/2; j > 0; j /= 2){
+            int l = i ^ j;
+            if(l>i) {
+                if(((i & k) == 0) && (array[i] > array[l])
+                    || ((i & k) != 0) && (array[i] < array[l])) {
+                        var temp = array[i];
+                        array[i] = array[l];
+                        array[l] = temp;
+
+                        indecies[i] ^= indecies[l];
+                        indecies[l] ^= indecies[i];
+                        indecies[i] ^= indecies[l];
                     }
             } 
             GroupMemoryBarrierWithGroupSync();

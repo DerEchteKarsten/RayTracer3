@@ -59,7 +59,7 @@ void main(uint3 threadId : SV_DispatchThreadID) {
         
         var probe_position = world_pos_from_depth(probe_depth, probe_pixel_coord, gconst.view);
         
-        if (abs(dot(probe_position - pixel_pos, surface.normal)) > cell_size) {
+       if(abs(dot(normalize(probe_position - pixel_pos), surface.normal)) > 0.01) {
             probe_weights[i] = 0.0;
         }else {
             probe_weights[i] = saturate(1.0 - abs(probe_depth - pixel_depth) / pixel_depth);

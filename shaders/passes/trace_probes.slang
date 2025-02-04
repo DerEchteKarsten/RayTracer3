@@ -34,8 +34,8 @@ void main() {
 
     uint2 ray_probe_index = probe_atlas_index % 8;
     uint16_t direction = directions[probe_atlas_index];
-    uint direction_index = direction & 0b0011111111111111;
-    uint mip = (direction & 0b1100000000000000) >> 14;
+    uint direction_index = direction & 0b0111111111111111;
+    uint mip = direction >> 15;
     uint size = (1 << mip) * 8;
     var direction_2d = float2(uint(direction_index / size), direction_index % size);
 
