@@ -1,3 +1,5 @@
 #!/bin/sh
+export VK_LAYER_PRINTF_ONLY_PRESET=1
+export VK_LAYER_PRINTF_TO_STDOUT=1
 ./compile.sh
 VK_LAYER_PRINTF_BUFFER_SIZE=10000 cargo run

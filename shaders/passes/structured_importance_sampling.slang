@@ -11,10 +11,10 @@
 [[vk::binding(3, 1)]] RWTexture2D<float> debug;
 
 
+groupshared uint culled_rays;
 groupshared float3 normals[16*16];
 groupshared float pdfs[8*8];
-groupshared uint pdf_thread_ids[8*8];
-groupshared uint supersample_ray_index;
+groupshared uint pdf_directions[8*8];
 
 [shader("compute")]
 [numthreads(8,8,1)]
@@ -28,9 +28,9 @@ void main(uint3 threadId : SV_DispatchThreadID, uint2 local_thread_id : SV_Group
             normals[thread_index * 4 + y*2+x] = GbufferDataPacked::from_uint4(gbuffer[threadId.xy * 2 + uint2(x, y)]).unpack_normal();
         }
     }
-    supersample_ray_index = 0;
+    culled_rays = 0;
     GroupMemoryBarrierWithGroupSync();
-    var direction_2d = float2(uint(thread_index / 8), thread_index % 8);
+    var direction_2d = float2(uint(thread_index % 8), thread_index / 8);
     float3 ray_direction = octa_decode((direction_2d + 0.5) / 8.0);
 
     var brdf_pdf = 0.0;
@@ -40,21 +40,33 @@ void main(uint3 threadId : SV_DispatchThreadID, uint2 local_thread_id : SV_Group
 
     RandomSamplerState rng = RandomSamplerState(threadId.xy, 0);
     var light_pdf = luminance(probe_atlas[threadId.xy].xyz); 
-    pdfs[thread_index] = brdf_pdf;// * light_pdf;
+    var pdf = brdf_pdf;// * light_pdf;
+    pdfs[thread_index] = pdf;
+    sort(thread_index, 64, pdfs, pdf_directions);
     
-    sort(thread_index, 64, pdfs, pdf_thread_ids);
-    
-    if (brdf_pdf < 0.3) {
-        uint index;
-        InterlockedAdd(supersample_ray_index, 1, index);
-        thread_index = pdf_thread_ids[index >> 4];
-        // var direction_2d = float2(uint(thread_index / 8), thread_index % 8);
-        // float3 ray_direction = octa_decode((direction_2d + 0.5) / 8.0);
-        out[uint2(thread_index / 8, thread_index % 8)] = uint16_t(0u << 15u) | uint16_t(thread_index);
-        debug[threadId.xy] = 1.0;
-    }else {
-        out[threadId.xy] = uint16_t(0u << 15u) | uint16_t(thread_index);
-        debug[threadId.xy] = 0.0;
-    }
+    int index = -1;
+    if(brdf_pdf < 0.0) {
+        InterlockedAdd(culled_rays, 1, index);
+    } 
 
+    GroupMemoryBarrierWithGroupSync();
+
+
+    if(pdfs[culled_rays / 3] < pdf || index != -1) {
+        uint direction;
+
+        if(index == -1) {
+            debug[threadId.xy] = 1.0;
+            direction = thread_index * 4;
+        }else {
+            direction = pdf_directions[culled_rays / 3] * 4; //+ index % 3 + 1;
+            debug[threadId.xy] = 0.5;
+        }
+
+        out[threadId.xy] = uint16_t(1 << 15) | uint16_t(direction);
+    }else {
+        debug[threadId.xy] = 0.0;
+        out[threadId.xy] = uint16_t(0 << 15) | uint16_t(thread_index);
+    }
+    debug[threadId.xy] = index;
 }

@@ -10,13 +10,10 @@ use ::imgui::Condition;
 use ash::vk;
 use assets::{gltf, model::Model};
 use backend::{
-    raytracing::RayTracingContext,
-    render_graph::{
-        ComputePassBuilder, FrameBuilder, ImageSize, PassBuilder, RayTracingPassBuilder,
-        RenderGraph, ResourceType, SceneResources,
-    },
-    utils::{Buffer, Image, ImageResource},
-    vulkan_context::Context,
+    raytracing::{self, RayTracingContext},
+    render_graph::{build::{ComputePassBuilder, FrameBuilder, PassBuilder, RasterizationPassBuilder, RayTracingPassBuilder}, ImageSize, RenderGraph, ResourceType, SceneResources},
+    utils::{create_sampler, Buffer, Image, ImageResource, SamplerInfo},
+    vulkan_context::{self, Context},
 };
 use glam::{vec3, IVec2, Mat4};
 use gpu_allocator::MemoryLocation;
@@ -68,7 +65,7 @@ struct GConst {
     pub samples: u32,
     pub proberng: u32,
     pub cell_size: f32,
-    pub buffer: [u32; 2],
+    pub mouse: [u32; 2],
 }
 
 fn main() {
@@ -90,17 +87,17 @@ fn main() {
         }))
         .unwrap();
 
-    let mut ctx = Context::new(&window, &window).unwrap();
-    let raytracing_ctx = RayTracingContext::new(&ctx);
+    Context::init(&window, &window);
+    RayTracingContext::init();
 
     let model = model_thread.join().unwrap();
-    let model = Model::from_gltf(&mut ctx, &raytracing_ctx, model).unwrap();
+    let model = Model::from_gltf(model).unwrap();
 
     let image = image_thread.join().unwrap();
     let skybox =
-        ImageResource::new_from_data(&mut ctx, image, vk::Format::R32G32B32A32_SFLOAT).unwrap();
+        ImageResource::new_from_data(image, vk::Format::R32G32B32A32_SFLOAT).unwrap();
 
-    let sampler_info = vk::SamplerCreateInfo {
+    let sampler_info = SamplerInfo {
         mag_filter: vk::Filter::LINEAR,
         min_filter: vk::Filter::LINEAR,
         address_mode_u: vk::SamplerAddressMode::CLAMP_TO_EDGE,
@@ -112,14 +109,11 @@ fn main() {
         ..Default::default()
     };
 
-    let skybox_sampler = unsafe { ctx.device.create_sampler(&sampler_info, None).unwrap() };
-
     let model_mat = Mat4::IDENTITY;
     let tlas = {
         let instaces = &[model.instance(model_mat)];
 
         let instance_buffer = Buffer::from_data(
-            &mut ctx,
             vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
                 | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
             instaces,
@@ -143,9 +137,8 @@ fn main() {
             .primitive_offset(0)
             .transform_offset(0);
 
-        raytracing_ctx
+        RayTracingContext::get()
             .create_acceleration_structure(
-                &mut ctx,
                 vk::AccelerationStructureTypeKHR::TOP_LEVEL,
                 &[as_struct_geo],
                 &[as_ranges],
@@ -155,7 +148,6 @@ fn main() {
     };
 
     let uniform_buffer = Buffer::new_aligned(
-        &mut ctx,
         vk::BufferUsageFlags::UNIFORM_BUFFER,
         MemoryLocation::CpuToGpu,
         size_of::<GConst>() as u64,
@@ -167,8 +159,8 @@ fn main() {
         geometry_infos: model.geometry_info_buffer,
         index_buffer: model.index_buffer,
         samplers: model.samplers,
-        skybox,
-        skybox_sampler,
+        skybox: Some(skybox),
+        skybox_sampler: Some(create_sampler(&sampler_info).unwrap()),
         texture_images: model.images,
         texture_samplers: model.textures,
         tlas,
@@ -178,57 +170,41 @@ fn main() {
 
     let mut imgui = ImGui::new(&window);
 
-    let mut render_graph = RenderGraph::new(&mut ctx, scene_resources, &mut imgui);
+    let mut render_graph = RenderGraph::new(scene_resources, &mut imgui);
+    let swapchain_format = render_graph.swpachain_format();
 
     render_graph.add_image_resource(
-        &mut ctx,
         "GBuffer",
         vk::Format::R32G32B32A32_UINT,
         ImageSize::Viewport,
-    );
-    render_graph.add_image_resource(
-        &mut ctx,
+    ).add_image_resource(
         "GBufferDepth",
         vk::Format::R32_SFLOAT,
         ImageSize::Viewport,
-    );
-    render_graph.add_image_resource(
-        &mut ctx,
+    ).add_image_resource(
         "Out",
-        render_graph.swpachain_format(),
+        swapchain_format,
         ImageSize::Viewport,
-    );
-    render_graph.add_temporal_image_resource(
-        &mut ctx,
+    ).add_temporal_image_resource(
         "ProbeAtlas",
         vk::Format::R32G32B32A32_SFLOAT,
         ImageSize::ViewportFraction { x: 0.5, y: 0.5 },
-    );
-    render_graph.add_buffer_resource(
-        &mut ctx,
+    ).add_buffer_resource(
         "SphericalHarmonics",
         (WINDOW_SIZE.y as u64 * WINDOW_SIZE.x as u64 * (9 * 4 * 3)).div_ceil(16),
-    );
-    render_graph.add_temporal_image_resource(
-        &mut ctx,
+    ).add_temporal_image_resource(
         "Light",
         vk::Format::R32G32B32A32_SFLOAT,
         ImageSize::Viewport,
-    );
-    render_graph.add_image_resource(
-        &mut ctx,
+    ).add_image_resource(
         "TraceDirections",
         vk::Format::R16_UINT,
         ImageSize::ViewportFraction { x: 0.5, y: 0.5 },
-    );
-
-    render_graph.add_image_resource(
-        &mut ctx,
+    ).add_image_resource(
         "DebugPDFs",
         vk::Format::R32_SFLOAT,
         ImageSize::ViewportFraction { x: 0.5, y: 0.5 },
     );
-
 
     let frame = FrameBuilder::default()
         .add_pass(
@@ -327,9 +303,15 @@ fn main() {
             .read("Light")
             .write("Out"),
         )
+        .add_pass(PassBuilder::new_raster("Gizzmos", RasterizationPassBuilder::default()
+            .attachment("Out")
+            .depth_attachment("GBufferDepth")
+            .mesh_shader("gizzmos.slang.spv")
+            .fragment_shader("gizzmos.slang.spv"))
+        )
         .set_back_buffer_source("Out");
 
-    render_graph.compile(frame, &mut ctx, &raytracing_ctx);
+    render_graph.compile(frame);
 
     let mut controles = Controls {
         ..Default::default()
@@ -348,7 +330,14 @@ fn main() {
     gconst.blendfactor = 1.0;
     gconst.samples = 1;
     gconst.bounces = 4;
-    gconst.cell_size = f32::tan(camera.fov * 16.0 * f32::max(1.0 / WINDOW_SIZE.y as f32, WINDOW_SIZE.y as f32 / (WINDOW_SIZE.x as f32 * WINDOW_SIZE.x as f32)));
+    gconst.cell_size = f32::tan(
+        camera.fov
+            * 16.0
+            * f32::max(
+                1.0 / WINDOW_SIZE.y as f32,
+                WINDOW_SIZE.y as f32 / (WINDOW_SIZE.x as f32 * WINDOW_SIZE.x as f32),
+            ),
+    );
     let mut frame_time = Duration::default();
     let mut last_time = Instant::now();
     let mut refrence_mode = false;
@@ -386,6 +375,10 @@ fn main() {
                         camera = new_cam;
                         gconst.planar_view_constants = camera.planar_view_constants();
                         gconst.frame = render_graph.frame_number.try_into().unwrap_or(0);
+                        gconst.mouse = [
+                            controles.cursor_position[0] as u32,
+                            controles.cursor_position[1] as u32,
+                        ];
                         render_graph.update_uniform(&gconst);
 
                         let ui = imgui.context.frame();
@@ -434,7 +427,7 @@ fn main() {
                         imgui.platform.prepare_render(ui, &window);
                         let draw_data = imgui.context.render();
 
-                        render_graph.draw(&ctx, &raytracing_ctx, draw_data);
+                        render_graph.draw(draw_data);
                     }
                     _ => (),
                 },

@@ -1,5 +1,5 @@
-use std::{ffi::CStr, sync::Arc};
-
+use std::{collections::HashMap, ffi::CStr, mem::MaybeUninit, sync::{Arc, Once}};
+use once_cell::sync::Lazy;
 use anyhow::{Ok, Result};
 use ash::vk;
 use gpu_allocator::{
@@ -35,12 +35,12 @@ pub struct ImageResource {
 impl Image {
     pub fn copy(
         &self,
-        ctx: &Context,
         cmd: &vk::CommandBuffer,
         other: &Image,
         src_layout: vk::ImageLayout,
         dst_layout: vk::ImageLayout,
     ) {
+        let ctx = Context::get();
         unsafe {
             ctx.device.cmd_copy_image(
                 *cmd,
@@ -74,12 +74,12 @@ impl Image {
 
     pub fn blit(
         &self,
-        ctx: &Context,
         cmd: &vk::CommandBuffer,
         other: &Image,
         src_layout: vk::ImageLayout,
         dst_layout: vk::ImageLayout,
     ) {
+        let ctx = Context::get();
         unsafe {
             ctx.device.cmd_blit_image(
                 *cmd,
@@ -244,13 +244,13 @@ impl Image {
     }
 
     pub(crate) fn new_2d(
-        ctx: &mut Context,
         usage: vk::ImageUsageFlags,
         memory_location: MemoryLocation,
         format: vk::Format,
         width: u32,
         height: u32,
     ) -> Result<Self> {
+        let ctx = Context::get_mut();
         let extent = vk::Extent3D {
             width,
             height,
@@ -298,12 +298,12 @@ impl Image {
 
 impl Buffer {
     pub(crate) fn new_aligned(
-        ctx: &mut Context,
         usage: vk::BufferUsageFlags,
         memory_location: MemoryLocation,
         size: vk::DeviceSize,
         alignment: Option<u64>,
     ) -> Result<Self> {
+        let ctx = Context::get_mut();
         let create_info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(usage | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS);
@@ -336,12 +336,11 @@ impl Buffer {
     }
 
     pub(crate) fn new(
-        ctx: &mut Context,
         usage: vk::BufferUsageFlags,
         memory_location: MemoryLocation,
         size: vk::DeviceSize,
     ) -> Result<Self> {
-        Self::new_aligned(ctx, usage, memory_location, size, None)
+        Self::new_aligned(usage, memory_location, size, None)
     }
 
     pub(crate) fn copy_data_to_buffer<T: Copy>(&self, data: &[T]) -> Result<()> {
@@ -362,7 +361,8 @@ impl Buffer {
         Ok(())
     }
 
-    pub(crate) fn destroy(self, ctx: &mut Context) -> Result<()> {
+    pub(crate) fn destroy(self) -> Result<()> {
+        let ctx = Context::get_mut();
         unsafe { ctx.device.destroy_buffer(self.buffer, None) };
         ctx.allocator.free(self.allocation).unwrap();
         Ok(())
@@ -370,7 +370,6 @@ impl Buffer {
 
     pub(crate) fn copy_to_image(
         &self,
-        ctx: &Context,
         cmd: &vk::CommandBuffer,
         dst: &Image,
         layout: vk::ImageLayout,
@@ -389,7 +388,7 @@ impl Buffer {
             });
 
         unsafe {
-            ctx.device.cmd_copy_buffer_to_image(
+            Context::get().device.cmd_copy_buffer_to_image(
                 *cmd,
                 self.buffer,
                 dst.image,
@@ -399,7 +398,8 @@ impl Buffer {
         };
     }
 
-    pub(crate) fn copy(self, ctx: &Context, cmd: &vk::CommandBuffer, dst_buffer: &Buffer) {
+    pub(crate) fn copy(self, cmd: &vk::CommandBuffer, dst_buffer: &Buffer) {
+        let ctx = Context::get();
         unsafe {
             let region = vk::BufferCopy::default().size(self.size);
             ctx.device.cmd_copy_buffer(
@@ -412,13 +412,12 @@ impl Buffer {
     }
 
     pub(crate) fn from_data_with_size<T: Copy>(
-        ctx: &mut Context,
         usage: vk::BufferUsageFlags,
         data: &[T],
         size: u64,
     ) -> Result<Buffer> {
+        let ctx = Context::get();
         let staging_buffer = Self::new(
-            ctx,
             vk::BufferUsageFlags::TRANSFER_SRC,
             MemoryLocation::CpuToGpu,
             size,
@@ -426,45 +425,42 @@ impl Buffer {
         staging_buffer.copy_data_to_buffer(data)?;
 
         let buffer = Self::new(
-            ctx,
             usage | vk::BufferUsageFlags::TRANSFER_DST,
             MemoryLocation::GpuOnly,
             size,
         )?;
 
         ctx.execute_one_time_commands(|cmd_buffer| {
-            staging_buffer.copy(ctx, cmd_buffer, &buffer);
+            staging_buffer.copy(cmd_buffer, &buffer);
         })?;
 
         Ok(buffer)
     }
 
     pub(crate) fn from_data<T: Copy>(
-        ctx: &mut Context,
         usage: vk::BufferUsageFlags,
         data: &[T],
     ) -> Result<Buffer> {
         let size = size_of_val(data) as _;
-        Self::from_data_with_size(ctx, usage, data, size)
+        Self::from_data_with_size(usage, data, size)
     }
 }
 
 impl ImageResource {
     pub(crate) fn new_2d(
-        ctx: &mut Context,
         usage: vk::ImageUsageFlags,
         memory_location: MemoryLocation,
         format: vk::Format,
         width: u32,
         height: u32,
     ) -> Result<Self> {
-        let image = Image::new_2d(ctx, usage, memory_location, format, width, height)?;
+        let ctx = Context::get();
+        let image = Image::new_2d(usage, memory_location, format, width, height)?;
         let extend = image.extent.clone();
         Ok(image.new_resource(&ctx.device, extend))
     }
 
     pub fn new_from_data(
-        ctx: &mut Context,
         image: DynamicImage,
         format: vk::Format,
     ) -> Result<Self> {
@@ -474,7 +470,6 @@ impl ImageResource {
             let image_data_raw = image_data.as_raw();
 
             let image_buffer = Buffer::new(
-                ctx,
                 vk::BufferUsageFlags::TRANSFER_SRC,
                 MemoryLocation::CpuToGpu,
                 (size_of::<f32>() * image_data.len()) as u64,
@@ -486,7 +481,6 @@ impl ImageResource {
             let image_data_raw = image_data.as_raw();
 
             let image_buffer = Buffer::new(
-                ctx,
                 vk::BufferUsageFlags::TRANSFER_SRC,
                 MemoryLocation::CpuToGpu,
                 (size_of::<u8>() * image_data.len()) as u64,
@@ -497,14 +491,13 @@ impl ImageResource {
         };
 
         let texture_image = Image::new_2d(
-            ctx,
             vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
             MemoryLocation::GpuOnly,
             format,
             width,
             height,
         )?;
-
+        let ctx = Context::get();
         ctx.execute_one_time_commands(|cmd| {
             let barrier = texture_image.memory_barrier(
                 vk::ImageLayout::UNDEFINED,
@@ -518,7 +511,6 @@ impl ImageResource {
             };
 
             image_buffer.copy_to_image(
-                &ctx,
                 cmd,
                 &texture_image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -540,19 +532,80 @@ impl ImageResource {
     }
 }
 
+#[derive(Default, PartialEq, Clone, Copy)]
+pub struct SamplerInfo {
+    pub mag_filter: vk::Filter,
+    pub min_filter: vk::Filter,
+    pub mipmap_mode: vk::SamplerMipmapMode,
+    pub address_mode_u: vk::SamplerAddressMode,
+    pub address_mode_v: vk::SamplerAddressMode,
+    pub address_mode_w: vk::SamplerAddressMode,
+    pub mip_lod_bias: f32,
+    pub anisotropy_enable: bool,
+    pub max_anisotropy: f32,
+    pub compare_enable: bool,
+    pub compare_op: vk::CompareOp,
+    pub min_lod: f32,
+    pub max_lod: f32,
+    pub border_color: vk::BorderColor,
+    pub unnormalized_coordinates: bool,
+}
+
+impl SamplerInfo {
+    fn to_vk<'a>(&self) -> vk::SamplerCreateInfo<'a> {
+        vk::SamplerCreateInfo {
+            mag_filter: self.mag_filter,
+            min_filter: self.min_filter,
+            mipmap_mode: self.mipmap_mode,
+            address_mode_u: self.address_mode_u,
+            address_mode_v: self.address_mode_v,
+            address_mode_w: self.address_mode_w,
+            mip_lod_bias: self.mip_lod_bias,
+            anisotropy_enable: if self.anisotropy_enable {
+                vk::TRUE
+            } else {
+                vk::FALSE
+            },
+            max_anisotropy: self.max_anisotropy,
+            compare_enable: if self.compare_enable {
+                vk::TRUE
+            } else {
+                vk::FALSE
+            },
+            compare_op: self.compare_op,
+            min_lod: self.min_lod,
+            max_lod: self.max_lod,
+            border_color: self.border_color,
+            unnormalized_coordinates: if self.unnormalized_coordinates {
+                vk::TRUE
+            } else {
+                vk::FALSE
+            },
+            ..Default::default()
+        }
+    }
+}
+
+pub fn create_sampler(info: &SamplerInfo) -> Result<vk::Sampler> {
+    static mut SAMPLER_CACHE: MaybeUninit<Vec<(SamplerInfo, vk::Sampler)>> = MaybeUninit::uninit();
+    static ONCE: Once = Once::new();
+    unsafe {
+        ONCE.call_once(|| {
+            SAMPLER_CACHE.write(Vec::new());
+        });
+        let cache = SAMPLER_CACHE.assume_init_mut();
+        
+        match cache.iter().find(|e| e.0 == *info) {
+            Some(sampler) => Ok(sampler.1),
+            None => {
+                let sampler = Context::get().device.create_sampler(&info.to_vk(), None)?;
+                cache.push((*info, sampler));
+                Ok(sampler)
+            }
+        }
+    }
+}
+
 pub fn alinged_size(size: u32, alignment: u32) -> u32 {
     (size + (alignment - 1)) & !(alignment - 1)
-}
-
-pub fn read_shader_from_bytes(bytes: &[u8]) -> Result<Vec<u32>> {
-    let mut cursor = std::io::Cursor::new(bytes);
-    Ok(ash::util::read_spv(&mut cursor)?)
-}
-
-pub fn module_from_bytes(device: &ash::Device, source: &[u8]) -> Result<vk::ShaderModule> {
-    let source = read_shader_from_bytes(source)?;
-
-    let create_info = vk::ShaderModuleCreateInfo::default().code(&source);
-    let res = unsafe { device.create_shader_module(&create_info, None) }?;
-    Ok(res)
 }

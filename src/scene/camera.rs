@@ -166,6 +166,7 @@ pub struct Controls {
     pub go_down: bool,
     pub look_around: bool,
     pub cursor_delta: [f32; 2],
+    pub cursor_position: [f64; 2],
 }
 
 impl Default for Controls {
@@ -179,6 +180,7 @@ impl Default for Controls {
             go_down: false,
             look_around: false,
             cursor_delta: [0.0; 2],
+            cursor_position: [0.0; 2],
         }
     }
 }
@@ -271,6 +273,12 @@ impl Controls {
                                 .set_cursor_grab(winit::window::CursorGrabMode::None)
                                 .unwrap_or(());
                         }
+                    }
+                    WindowEvent::CursorMoved {
+                        device_id: _,
+                        position,
+                    } => {
+                        new_state.cursor_position = [position.x, position.y];
                     }
                     _ => {}
                 };

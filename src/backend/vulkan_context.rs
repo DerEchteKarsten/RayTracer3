@@ -1,6 +1,5 @@
 use std::{
-    ffi::{c_char, CStr},
-    os::raw::c_void,
+    cell::LazyCell, collections::HashMap, ffi::{c_char, CStr}, mem::MaybeUninit, os::raw::c_void, sync::{LazyLock, Mutex, Once, RwLock}
 };
 
 use anyhow::Result;
@@ -10,8 +9,11 @@ use gpu_allocator::{
     AllocationSizes, AllocatorDebugSettings,
 };
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use winit::{dpi::PhysicalSize, event_loop::EventLoop, window::WindowAttributes};
 
-use super::physical_device::{PhysicalDevice, QueueFamily};
+use crate::WINDOW_SIZE;
+
+use super::{physical_device::{PhysicalDevice, QueueFamily}, raytracing::RayTracingContext};
 
 pub struct Surface {
     pub(crate) ash: ash::khr::surface::Instance,
@@ -33,7 +35,29 @@ pub struct Context {
     pub(crate) _entry: ash::Entry,
 }
 
+static mut CONTEXT: MaybeUninit<Context> = MaybeUninit::uninit();
+
 impl Context {
+    pub(crate) fn init(display_handle: &dyn HasDisplayHandle,
+        window_handle: &dyn HasWindowHandle) -> Result<()> {
+        unsafe {
+            CONTEXT.write(Context::new(display_handle, window_handle)?);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn get() -> &'static Context {
+        unsafe {
+            CONTEXT.assume_init_ref()
+        }
+    }
+
+    pub(crate) fn get_mut() -> &'static mut Context {
+        unsafe {
+            CONTEXT.assume_init_mut()
+        }
+    }
+
     const DEVICE_EXTENSIONS: [&'static CStr; 11] = [
         swapchain::NAME,
         ray_tracing_pipeline::NAME,
@@ -441,22 +465,39 @@ impl Context {
     }
 
     pub fn create_shader_module(&self, code_path: &str) -> Result<vk::ShaderModule> {
-        let mut code = std::fs::File::open(code_path)?;
-        let decoded_code = ash::util::read_spv(&mut code)?;
-        let create_info = vk::ShaderModuleCreateInfo::default().code(&decoded_code);
-
-        Ok(unsafe { self.device.create_shader_module(&create_info, None) }?)
+        static mut SHADER_CACHE: MaybeUninit<HashMap<String, vk::ShaderModule>> = MaybeUninit::uninit();
+        static ONCE: Once = Once::new();
+        unsafe {
+            ONCE.call_once(|| {
+                SHADER_CACHE.write(HashMap::new());
+            });
+            let cache = SHADER_CACHE.assume_init_mut();
+            
+            match cache.get(code_path) {
+                Some(module) => Ok(*module),
+                None => {
+                    let mut code = std::fs::File::open(code_path)?;
+                    let decoded_code = ash::util::read_spv(&mut code)?;
+                    let create_info = vk::ShaderModuleCreateInfo::default().code(&decoded_code);
+            
+                    let module = self.device.create_shader_module(&create_info, None)?;
+                    cache.insert(code_path.to_owned(), module);
+                    Ok(module)
+                }
+            }
+        }
     }
-
+    
     pub fn create_shader_stage(
         &self,
         stage: vk::ShaderStageFlags,
         path: &str,
+        main: &'static str,
     ) -> Result<vk::PipelineShaderStageCreateInfo> {
         let module = self.create_shader_module(path)?;
         Ok(vk::PipelineShaderStageCreateInfo::default()
             .stage(stage)
             .module(module)
-            .name(CStr::from_bytes_with_nul("main\0".as_bytes())?))
+            .name(CStr::from_bytes_until_nul(main.as_bytes())?))
     }
 }

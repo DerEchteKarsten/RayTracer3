@@ -184,10 +184,10 @@ impl Model {
     }
 
     pub fn from_gltf(
-        ctx: &mut Context,
-        raytracing_ctx: &RayTracingContext,
         model: gltf::Model,
     ) -> Result<Self> {
+        let ctx = Context::get();
+
         let vertices = model.vertices.as_slice();
         let indices = model.indices.as_slice();
         for v in vertices {
@@ -217,7 +217,6 @@ impl Model {
             .collect::<Vec<_>>();
 
         let transform_buffer = Buffer::from_data(
-            ctx,
             vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
                 | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
             transforms.as_slice(),
@@ -231,7 +230,6 @@ impl Model {
             let pixels = i.pixels.as_slice();
 
             let staging = Buffer::new(
-                ctx,
                 vk::BufferUsageFlags::TRANSFER_SRC,
                 MemoryLocation::CpuToGpu,
                 size_of_val(pixels) as _,
@@ -240,14 +238,13 @@ impl Model {
             staging.copy_data_to_buffer(pixels)?;
 
             let image = ImageResource::new_2d(
-                ctx,
                 vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
                 MemoryLocation::GpuOnly,
                 vk::Format::R8G8B8A8_SRGB,
                 width,
                 height,
             )?;
-
+            let ctx = Context::get();
             ctx.execute_one_time_commands(|cmd| {
                 unsafe {
                     ctx.device.cmd_pipeline_barrier2(
@@ -262,7 +259,6 @@ impl Model {
                 };
 
                 staging.copy_to_image(
-                    &ctx,
                     cmd,
                     &image.image,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -288,7 +284,6 @@ impl Model {
 
         if images.is_empty() {
             let image = ImageResource::new_2d(
-                ctx,
                 vk::ImageUsageFlags::SAMPLED,
                 MemoryLocation::GpuOnly,
                 vk::Format::R8G8B8A8_SRGB,
@@ -352,7 +347,6 @@ impl Model {
         }
 
         let vertex_buffer = Buffer::from_data(
-            ctx,
             vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
                 | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
                 | vk::BufferUsageFlags::STORAGE_BUFFER
@@ -361,7 +355,6 @@ impl Model {
         )?;
 
         let index_buffer = Buffer::from_data(
-            ctx,
             vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
                 | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
                 | vk::BufferUsageFlags::STORAGE_BUFFER
@@ -440,13 +433,11 @@ impl Model {
             max_primitive_counts.push(primitive_count)
         }
         let geometry_info_buffer = Buffer::from_data(
-            ctx,
             vk::BufferUsageFlags::STORAGE_BUFFER,
             geometry_infos.as_slice(),
         )?;
 
-        let blas = raytracing_ctx.create_acceleration_structure(
-            ctx,
+        let blas = RayTracingContext::get().create_acceleration_structure(
             vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
             &as_geometries,
             &as_ranges,

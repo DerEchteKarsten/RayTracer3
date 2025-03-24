@@ -23,9 +23,13 @@ void main() {
     uint2 pixel_coord = probe_coord * 16;
 
     var gbuffer_depth = gbuffer_depth[pixel_coord];
+
+    
     if(gbuffer_depth == BACKGROUND_DEPTH) {
-        probe_atlas[probe_atlas_index] = float4(0.0, 0.0, 0.0, 1.0); //TEMPORARY
+        probe_atlas[probe_atlas_index] = float4(0.0, 0.0, 0.0, BACKGROUND_DEPTH);
         return;
+    }else{
+        probe_atlas[probe_atlas_index] = float4(0.0, 0.0, 0.0, 0.0);
     }
 
 
@@ -37,9 +41,9 @@ void main() {
     uint direction_index = direction & 0b0111111111111111;
     uint mip = direction >> 15;
     uint size = (1 << mip) * 8;
-    var direction_2d = float2(uint(direction_index / size), direction_index % size);
+    float2 direction_2d = float2(uint(direction_index % size), direction_index / size);
 
-    var ray_probe_direction = octa_decode((direction_2d + float2(ray_rng.uniform_float(), ray_rng.uniform_float())) / float(size)); 
+    var ray_probe_direction = octa_decode((float2(direction_2d) + float2(ray_rng.uniform_float(), ray_rng.uniform_float())) / float(size)); 
     // var ray_probe_direction = octa_decode((float2(ray_probe_index) + float2(ray_rng.uniform_float(), ray_rng.uniform_float())) / 8.0);
 
     var tangend = build_orthonormal_basis(gbuffer_data.normal);
@@ -68,7 +72,7 @@ void main() {
     
     // var radiance = emissive * sample.value_over_pdf * primary_brdf.evaluate(ray_probe_direction, ray.Origin).value_over_pdf;
 
-    probe_atlas[probe_atlas_index] = float4(lerp(prev_probe_atlas[probe_atlas_index].xyz, radiance, gconst.blendfactor), probe_depth); //float4(float3(exp(-payload.depth / 100.0)), 1.0);
+    probe_atlas[probe_coord * 8 + uint2((direction_2d / float(size)) * 8)] = float4(float3(direction_2d / float(size), 0.0), probe_depth); //float4(lerp(prev_probe_atlas[probe_atlas_index].xyz, radiance, gconst.blendfactor), probe_depth); //float4(float3(exp(-payload.depth / 100.0)), 1.0);
 
     // probe_atlas[probe_atlas_index] = float4(probe_rng.uniform_float(), probe_rng.uniform_float(), probe_rng.uniform_float(), 1.0);
 }

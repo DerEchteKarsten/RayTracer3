@@ -1,256 +1,15 @@
-use std::{
-    collections::{HashMap, HashSet},
-    ffi::CStr,
-    mem::MaybeUninit,
-    num::NonZero,
-    ops::DerefMut,
-    rc::Rc,
-    slice::from_ref,
-    sync::Arc,
+use std::{collections::HashSet, ffi::CStr, slice::from_ref};
+
+use crate::{
+    backend::raytracing::{RayTracingContext, RayTracingShaderCreateInfo, RayTracingShaderGroup},
+    GConst,
 };
 
-use anyhow::Result;
-use ash::vk::{self, ImageLayout};
-use gltf::json::extensions::image::Image;
-use gpu_allocator::{
-    vulkan::{Allocator, AllocatorCreateDesc},
-    AllocationSizes, AllocatorDebugSettings,
-};
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use std::cell::RefCell;
-
-use crate::{assets::model::Model, imgui::ImGui, GConst, WINDOW_SIZE};
-
-use super::{
-    raytracing::{
-        AccelerationStructure, RayTracingContext, RayTracingShaderCreateInfo,
-        RayTracingShaderGroup, ShaderBindingTable,
-    },
-    swapchain::Swapchain,
-    utils::{Buffer, ImageResource},
-    vulkan_context::Context,
-};
-
-pub const FRAMES_IN_FLIGHT: u64 = 3;
-
-#[derive(PartialEq, Eq)]
-pub enum ResourceType {
-    Buffer,
-    Image,
-}
-
-enum ResourceTemporal {
-    Single(ResourceData),
-    Temporal([ResourceData; 2]),
-}
-
-enum ResourceData {
-    Buffer(Buffer),
-    Image(ImageResource),
-}
-
-impl Default for ResourceData {
-    fn default() -> Self {
-        Self::Image(ImageResource::default())
-    }
-}
-
-pub struct Resource {
-    pub ty: ResourceType,
-    handle: ResourceTemporal,
-}
-
-impl Resource {
-    fn get_current(&self, graph: &RenderGraph) -> &ResourceData {
-        match &self.handle {
-            ResourceTemporal::Single(data) => data,
-            ResourceTemporal::Temporal(data) => &data[(graph.frame_number % 2) as usize],
-        }
-    }
-}
-
-pub struct SceneResources {
-    //TODO
-    pub(crate) vertex_buffer: Buffer,
-    pub(crate) index_buffer: Buffer,
-    pub(crate) geometry_infos: Buffer,
-    pub(crate) samplers: Vec<vk::Sampler>,
-    pub(crate) texture_images: Vec<ImageResource>,
-    pub(crate) texture_samplers: Vec<(usize, usize)>,
-
-    pub(crate) tlas: AccelerationStructure,
-    pub(crate) uniform_buffer: Buffer,
-    pub(crate) skybox: ImageResource,
-    pub(crate) skybox_sampler: vk::Sampler,
-}
-
-struct ImguiResources {
-    renderpass: vk::RenderPass,
-    frame_buffers: Vec<vk::Framebuffer>,
-    renderer: imgui_rs_vulkan_renderer::Renderer,
-}
-
-pub struct StaticResources {
-    swapchain: Swapchain,
-    imgui_resources: ImguiResources,
-    scene: SceneResources,
-    frame_timeline_semaphore: vk::Semaphore,
-}
-
-impl StaticResources {
-    fn new(ctx: &Context, scene: SceneResources, imgui: &mut ImGui) -> Result<Self> {
-        let swapchain = Swapchain::new(&ctx)?;
-
-        let mut timeline_create_info = vk::SemaphoreTypeCreateInfo::default()
-            .initial_value(FRAMES_IN_FLIGHT - 1)
-            .semaphore_type(vk::SemaphoreType::TIMELINE);
-
-        let create_info = vk::SemaphoreCreateInfo::default().push_next(&mut timeline_create_info);
-        let frame_timeline_semaphore =
-            unsafe { ctx.device.create_semaphore(&create_info, None).unwrap() };
-
-        let attachments = [vk::AttachmentDescription::default()
-            .initial_layout(ImageLayout::PRESENT_SRC_KHR)
-            .final_layout(ImageLayout::PRESENT_SRC_KHR)
-            .format(swapchain.format)
-            .load_op(vk::AttachmentLoadOp::LOAD)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .samples(vk::SampleCountFlags::TYPE_1)];
-        let attachment = [vk::AttachmentReference::default()
-            .attachment(0)
-            .layout(ImageLayout::GENERAL)];
-        let subpasses = [vk::SubpassDescription::default()
-            .color_attachments(&attachment)
-            .input_attachments(&[])];
-
-        let render_pass_create_info = vk::RenderPassCreateInfo::default()
-            .attachments(&attachments)
-            .subpasses(&subpasses);
-
-        let renderpass = unsafe {
-            ctx.device
-                .create_render_pass(&render_pass_create_info, None)
-                .unwrap()
-        };
-
-        let mut frame_buffers = Vec::new();
-
-        for (i, image) in swapchain.images.iter().enumerate() {
-            let attachment = [image.view];
-            let frame_buffer_info = vk::FramebufferCreateInfo::default()
-                .attachments(&attachment)
-                .height(WINDOW_SIZE.y as u32)
-                .width(WINDOW_SIZE.x as u32)
-                .layers(1)
-                .render_pass(renderpass);
-            frame_buffers.push(unsafe {
-                ctx.device
-                    .create_framebuffer(&frame_buffer_info, None)
-                    .unwrap()
-            })
-        }
-
-        let renderer = imgui_rs_vulkan_renderer::Renderer::with_default_allocator(
-            &ctx.instance,
-            ctx.physical_device.handel,
-            ctx.device.clone(),
-            ctx.graphics_queue,
-            ctx.command_pool,
-            renderpass,
-            &mut imgui.context,
-            None,
-        )
-        .unwrap();
-
-        Ok(Self {
-            swapchain,
-            scene,
-            frame_timeline_semaphore,
-            imgui_resources: ImguiResources {
-                frame_buffers,
-                renderpass,
-                renderer,
-            },
-        })
-    }
-}
-
-enum RenderPassCommand {
-    Raytracing {
-        shader_binding_table: ShaderBindingTable,
-        x: u32,
-        y: u32,
-    },
-    Raster(),
-    Compute {
-        x: u32,
-        y: u32,
-        z: u32,
-    },
-    ComputeIndirect {
-        indirect_buffer: vk::Buffer,
-    },
-    Custom(Box<dyn Fn(&vk::CommandBuffer, &RenderPass) -> ()>),
-}
-
-enum RenderPassType {
-    Compute,
-    Raytracing,
-}
-
-struct RenderPass {
-    command: RenderPassCommand,
-    pipeline: vk::Pipeline,
-    layout: vk::PipelineLayout,
-    bindless_descriptor: bool,
-    descriptor_set: Option<vk::DescriptorSet>,
-    temporal_descriptor_sets: Option<[vk::DescriptorSet; 2]>,
-    temporal_descriptor_sets2: Option<[vk::DescriptorSet; 2]>,
-    input_resources: Vec<String>,
-    output_resources: Vec<String>,
-    sync_resources: Vec<ResourceSync>,
-    name: String,
-    active: bool,
-    ty: RenderPassType,
-}
-
-struct ResourceSync {
-    resource_key: String,
-    last_write: vk::PipelineStageFlags2,
-    old_layout: Option<vk::ImageLayout>,
-    new_layout: Option<vk::ImageLayout>,
-}
-
-pub struct RenderGraph {
-    pub resources: HashMap<String, Resource>,
-    pub static_resources: StaticResources,
-    passes: Vec<RenderPass>,
-    pub back_buffer: String,
-
-    static_descriptor_set: vk::DescriptorSet,
-    static_descriptor_set_layout: vk::DescriptorSetLayout,
-
-    frame_data: [FrameData; FRAMES_IN_FLIGHT as usize],
-
-    pub frame_number: u64,
-}
-
-struct FrameData {
-    command_pool: vk::CommandPool,
-    cmd: vk::CommandBuffer,
-    frame_number: u64,
-}
-
-pub enum ImageSize {
-    Custom { x: u32, y: u32 },
-    Viewport,
-    ViewportFraction { x: f32, y: f32 },
-}
+use super::*;
+use build::*;
+use run::*;
 
 impl RenderGraph {
-    const RAYMISS_BYTES: &[u8] = include_bytes!("./../../shaders/bin/default_miss.slang.spv");
-    const RAYHIT_BYTES: &[u8] = include_bytes!("./../../shaders/bin/default_hit.slang.spv");
-
     pub fn swpachain_format(&self) -> vk::Format {
         self.static_resources.swapchain.format
     }
@@ -260,11 +19,11 @@ impl RenderGraph {
     }
 
     pub fn new(
-        ctx: &mut Context,
         scene_resources: SceneResources,
         imgui: &mut ImGui,
     ) -> RenderGraph {
-        let static_resources = StaticResources::new(&ctx, scene_resources, imgui).unwrap();
+        let ctx = Context::get();
+        let static_resources = StaticResources::new(scene_resources, imgui).unwrap();
         let static_bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -360,7 +119,7 @@ impl RenderGraph {
         let blue_noise_image = image::open("./assets/bluenoise.png").unwrap();
 
         let blue_noise_image =
-            ImageResource::new_from_data(ctx, blue_noise_image, vk::Format::R8G8B8A8_SRGB).unwrap();
+            ImageResource::new_from_data(blue_noise_image, vk::Format::R8G8B8A8_SRGB).unwrap();
 
         let geometry_infos = [vk::DescriptorBufferInfo::default()
             .buffer(static_resources.scene.geometry_infos.buffer)
@@ -375,9 +134,9 @@ impl RenderGraph {
             .offset(0)
             .range(static_resources.scene.index_buffer.size)];
         let skybox = [vk::DescriptorImageInfo::default()
-            .image_view(static_resources.scene.skybox.view)
+            .image_view(static_resources.scene.skybox.as_ref().unwrap().view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .sampler(static_resources.scene.skybox_sampler)];
+            .sampler(static_resources.scene.skybox_sampler.unwrap())];
         let uniform = [vk::DescriptorBufferInfo::default()
             .buffer(static_resources.scene.uniform_buffer.buffer)
             .offset(0)
@@ -385,7 +144,7 @@ impl RenderGraph {
         let bluenoise_image_info = [vk::DescriptorImageInfo::default()
             .image_view(blue_noise_image.view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .sampler(static_resources.scene.skybox_sampler)];
+            .sampler(static_resources.scene.skybox_sampler.unwrap())];
 
         let writes = [
             write,
@@ -499,7 +258,7 @@ impl RenderGraph {
             .unwrap();
     }
 
-    fn build_sync_resources(&mut self) {
+    pub(super) fn build_sync_resources(&mut self) {
         let mut wirten_resources: HashSet<&str> = HashSet::new();
         let mut last_writes: HashMap<&str, vk::PipelineStageFlags2> = HashMap::new();
 
@@ -526,6 +285,7 @@ impl RenderGraph {
                         RenderPassType::Raytracing => {
                             vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
                         }
+                        RenderPassType::Rasterization => vk::PipelineStageFlags2::MESH_SHADER_EXT,
                     },
                 );
             }
@@ -535,11 +295,12 @@ impl RenderGraph {
 
     pub fn add_image_resource(
         &mut self,
-        ctx: &mut Context,
         name: &str,
         format: vk::Format,
         size: ImageSize,
-    ) {
+    ) -> &mut Self {
+        let ctx = Context::get();
+
         let (width, height) = match size {
             ImageSize::Custom { x, y } => (x, y),
             ImageSize::Viewport => (WINDOW_SIZE.x as u32, WINDOW_SIZE.y as u32),
@@ -549,7 +310,6 @@ impl RenderGraph {
             ),
         };
         let image = ImageResource::new_2d(
-            ctx,
             vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
             gpu_allocator::MemoryLocation::GpuOnly,
             format,
@@ -579,11 +339,12 @@ impl RenderGraph {
                 ty: ResourceType::Image,
             },
         );
+        self
     }
 
-    pub fn add_buffer_resource(&mut self, ctx: &mut Context, name: &str, size: u64) {
+    pub fn add_buffer_resource(&mut self, name: &str, size: u64) -> &mut Self{
+        let ctx = Context::get();
         let buffer = Buffer::new(
-            ctx,
             vk::BufferUsageFlags::STORAGE_BUFFER,
             gpu_allocator::MemoryLocation::GpuOnly,
             size,
@@ -602,15 +363,17 @@ impl RenderGraph {
                 ty: ResourceType::Buffer,
             },
         );
+        self
     }
 
     pub fn add_temporal_image_resource(
         &mut self,
-        ctx: &mut Context,
         name: &str,
         format: vk::Format,
         size: ImageSize,
-    ) {
+    ) -> &mut Self{
+        let ctx = Context::get();
+
         let (width, height) = match size {
             ImageSize::Custom { x, y } => (x, y),
             ImageSize::Viewport => (WINDOW_SIZE.x as u32, WINDOW_SIZE.y as u32),
@@ -622,7 +385,6 @@ impl RenderGraph {
         let mut images: [ResourceData; 2] = Default::default();
         for i in 0..2 {
             let image = ImageResource::new_2d(
-                ctx,
                 vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
                 gpu_allocator::MemoryLocation::GpuOnly,
                 format,
@@ -655,14 +417,15 @@ impl RenderGraph {
                 ty: ResourceType::Image,
             },
         );
+        self
     }
 
     pub fn compile(
         &mut self,
         frame: FrameBuilder,
-        ctx: &mut Context,
-        raytracing_ctx: &RayTracingContext,
     ) {
+        let raytracing_ctx = RayTracingContext::get();
+        let ctx = Context::get();
         let mut max_sets = 0;
         let mut pool_sizes: HashMap<vk::DescriptorType, u32> = HashMap::new();
 
@@ -908,40 +671,27 @@ impl RenderGraph {
                     }
                 }
                 PassBuilderType::Raytracing(raytracing_pass) => {
-                    let raygen_source =
-                        std::fs::read(format!("./shaders/bin/{}", raytracing_pass.ray_gen_source))
-                            .unwrap();
-                    let miss_source = raytracing_pass
-                        .override_miss_shader_source
-                        .and_then(|e| Some(std::fs::read(format!("./shaders/bin/{}", e)).unwrap()))
-                        .unwrap_or(Self::RAYMISS_BYTES.to_vec());
-                    let chit_source = raytracing_pass
-                        .override_hit_shader_source
-                        .and_then(|e| Some(std::fs::read(format!("./shaders/bin/{}", e)).unwrap()))
-                        .unwrap_or(Self::RAYHIT_BYTES.to_vec());
-
                     let (pipeline, group_info) = raytracing_ctx
                         .create_raytracing_pipeline(
-                            ctx,
                             layout,
                             &[
                                 RayTracingShaderCreateInfo {
                                     source: &[(
-                                        raygen_source.as_slice(),
+                                        raytracing_pass.ray_gen_source,
                                         vk::ShaderStageFlags::RAYGEN_KHR,
                                     )],
                                     group: RayTracingShaderGroup::RayGen,
                                 },
                                 RayTracingShaderCreateInfo {
                                     source: &[(
-                                        miss_source.as_slice(),
+                                        raytracing_pass.override_miss_shader_source.unwrap_or("./../../../shaders/bin/default_miss.slang.spv"),
                                         vk::ShaderStageFlags::MISS_KHR,
                                     )],
                                     group: RayTracingShaderGroup::Miss,
                                 },
                                 RayTracingShaderCreateInfo {
                                     source: &[(
-                                        chit_source.as_slice(),
+                                        raytracing_pass.override_miss_shader_source.unwrap_or("./../../../shaders/bin/default_hit.slang.spv"),
                                         vk::ShaderStageFlags::CLOSEST_HIT_KHR,
                                     )],
                                     group: RayTracingShaderGroup::Hit,
@@ -950,7 +700,7 @@ impl RenderGraph {
                         )
                         .unwrap();
                     let shader_binding_table =
-                        ShaderBindingTable::new(ctx, raytracing_ctx, &pipeline, &group_info)
+                        ShaderBindingTable::new(&pipeline, &group_info)
                             .unwrap();
                     (
                         RenderPassCommand::Raytracing {
@@ -960,6 +710,118 @@ impl RenderGraph {
                         },
                         pipeline,
                     )
+                }
+                PassBuilderType::Rasterization(raster_pass) => {
+                    let color_attachments = raster_pass
+                        .attachments
+                        .iter()
+                        .map(|e| {
+                            let resource = &self.resources[&e.0];
+                            ColorAttachment {
+                                clear: e.1,
+                                format: resource.get_format().unwrap_or_else(|| {
+                                    log::error!("Color Attachment Format not found");
+                                    vk::Format::UNDEFINED
+                                }),
+                                resource: e.0.clone(),
+                            }
+                        })
+                        .collect::<Vec<ColorAttachment>>();
+                    
+                    let formats = color_attachments.iter().map(|e| e.format).collect::<Vec<_>>();
+
+                    let depth_attachment = if let Some(attachment) = &raster_pass.depth_attachment {
+                        Some(DepthStencilAttachment {
+                            clear: attachment.1,
+                            format: self.resources[&attachment.0].get_format().unwrap_or_else(|| {
+                                log::error!("Depth Attachment Format not found");
+                                vk::Format::UNDEFINED
+                            }),
+                            resource: attachment.0.clone(),
+                        })
+                    }else {None};
+
+                    let stencil_attachment = if let Some(attachment) = &raster_pass.stencil_attachment {
+                        Some(DepthStencilAttachment {
+                            clear: attachment.1,
+                            format: self.resources[&attachment.0].get_format().unwrap_or_else(|| {
+                                log::error!("Stencil Attachment Format not found");
+                                vk::Format::UNDEFINED
+                            }),
+                            resource: attachment.0.clone(),
+                        })
+                    }else {None};
+
+                    let mut rendering = vk::PipelineRenderingCreateInfo::default()
+                        .color_attachment_formats(formats.as_slice())
+                        .depth_attachment_format(if let Some(da) = &depth_attachment {da.format} else {vk::Format::UNDEFINED})
+                        .stencil_attachment_format(if let Some(da) = &stencil_attachment {da.format} else {vk::Format::UNDEFINED});
+
+                    let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+                        .dynamic_states(&[
+                            vk::DynamicState::VIEWPORT_WITH_COUNT,
+                            vk::DynamicState::SCISSOR_WITH_COUNT,
+                            vk::DynamicState::DEPTH_CLAMP_ENABLE_EXT,
+                            vk::DynamicState::RASTERIZER_DISCARD_ENABLE,
+                            vk::DynamicState::POLYGON_MODE_EXT,
+                            vk::DynamicState::CULL_MODE,
+                            vk::DynamicState::FRONT_FACE,
+                            vk::DynamicState::DEPTH_BIAS_ENABLE,
+                            vk::DynamicState::DEPTH_BIAS,
+                            vk::DynamicState::LINE_WIDTH,
+                            vk::DynamicState::LOGIC_OP_ENABLE_EXT,
+                            vk::DynamicState::LOGIC_OP_EXT,
+                            vk::DynamicState::BLEND_CONSTANTS,
+                            vk::DynamicState::COLOR_BLEND_EQUATION_EXT,
+                            vk::DynamicState::COLOR_WRITE_MASK_EXT,
+                            vk::DynamicState::BLEND_CONSTANTS,
+                            vk::DynamicState::DEPTH_TEST_ENABLE,
+                            vk::DynamicState::DEPTH_WRITE_ENABLE,
+                            vk::DynamicState::DEPTH_COMPARE_OP,
+                            vk::DynamicState::DEPTH_BOUNDS_TEST_ENABLE,
+                            vk::DynamicState::STENCIL_TEST_ENABLE,
+                            vk::DynamicState::STENCIL_OP,
+                            vk::DynamicState::DEPTH_BOUNDS,
+                        ]);
+
+                    let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
+                        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+                    let stages = [
+                        ctx.create_shader_stage(
+                            vk::ShaderStageFlags::MESH_EXT,
+                            format!("./shaders/bin/{}", raster_pass.mesh_shader).as_str(),
+                        )
+                        .unwrap(),
+                        ctx.create_shader_stage(
+                            vk::ShaderStageFlags::FRAGMENT,
+                            format!("./shaders/bin/{}", raster_pass.fragment_shader).as_str(),
+                        )
+                        .unwrap()
+                    ];
+                    let create_info = vk::GraphicsPipelineCreateInfo::default()
+                        .stages(&stages)
+                        .layout(layout)
+                        .dynamic_state(&dynamic_state)
+                        .multisample_state(&multisampling);
+                    create_info.push_next(&mut rendering);
+
+                    let pipeline = unsafe {
+                        ctx.device
+                            .create_graphics_pipelines(
+                                vk::PipelineCache::null(),
+                                &[create_info],
+                                None,
+                            )
+                            .unwrap()
+                    }[0];
+
+                    (RenderPassCommand::Raster{
+                        color_attachments,
+                        depth_attachment,
+                        render_area: raster_pass.render_area.unwrap_or(UVec2::new(WINDOW_SIZE.x as u32, WINDOW_SIZE.y as u32)),
+                        stencil_attachment,
+                    }, pipeline)
                 }
             };
 
@@ -1144,576 +1006,12 @@ impl RenderGraph {
                 ty: match pass.ty {
                     PassBuilderType::Compute(_) => RenderPassType::Compute,
                     PassBuilderType::Raytracing(_) => RenderPassType::Raytracing,
+                    PassBuilderType::Rasterization(_) => RenderPassType::Rasterization,
                 },
             };
             self.passes.push(compiled_pass);
         }
         self.build_sync_resources();
         self.back_buffer = frame.back_buffer;
-    }
-
-    fn begin_frame(&self, ctx: &Context, frame_in_flight: u64) -> u32 {
-        let frame = &self.frame_data[frame_in_flight as usize];
-        let semaphore = [self.static_resources.frame_timeline_semaphore];
-        let values = [frame.frame_number];
-        let wait_info = vk::SemaphoreWaitInfo::default()
-            .semaphores(&semaphore)
-            .values(&values);
-        unsafe { ctx.device.wait_semaphores(&wait_info, 1000000000).unwrap() };
-        unsafe {
-            ctx.device
-                .reset_command_pool(frame.command_pool, vk::CommandPoolResetFlags::empty())
-                .unwrap()
-        };
-
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-
-        unsafe {
-            ctx.device
-                .begin_command_buffer(frame.cmd, &begin_info)
-                .unwrap()
-        };
-
-        unsafe {
-            self.static_resources
-                .swapchain
-                .ash_swapchain
-                .acquire_next_image(
-                    self.static_resources.swapchain.vk_swapchain,
-                    1000000000,
-                    self.static_resources.swapchain.frame_resources[frame_in_flight as usize]
-                        .image_availible_semaphore,
-                    vk::Fence::null(),
-                )
-                .unwrap()
-        }
-        .0
-    }
-
-    fn execute_passes(
-        &self,
-        ctx: &Context,
-        raytracing_ctx: &RayTracingContext,
-        frame_in_flight: u64,
-        swapchain_image_index: u32,
-    ) {
-        let frame = &self.frame_data[frame_in_flight as usize];
-        unsafe {
-            for pass in &self.passes {
-                if !pass.active {
-                    continue;
-                }
-                let bind_point = match pass.command {
-                    RenderPassCommand::Compute { .. }
-                    | RenderPassCommand::ComputeIndirect { .. } => {
-                        Some(vk::PipelineBindPoint::COMPUTE)
-                    }
-                    RenderPassCommand::Raytracing { .. } => {
-                        Some(vk::PipelineBindPoint::RAY_TRACING_KHR)
-                    }
-                    RenderPassCommand::Raster { .. } => Some(vk::PipelineBindPoint::GRAPHICS),
-                    RenderPassCommand::Custom { .. } => None,
-                };
-
-                if !pass.sync_resources.is_empty() {
-                    let mut buffers = Vec::new();
-                    let mut images = Vec::new();
-                    for sync_resource in &pass.sync_resources {
-                        let resource = &self.resources[&sync_resource.resource_key];
-                        match &resource.get_current(self) {
-                            ResourceData::Buffer(buffer) => {
-                                buffers.push(
-                                    vk::BufferMemoryBarrier2::default()
-                                        .buffer(buffer.buffer)
-                                        .size(buffer.size)
-                                        .src_stage_mask(sync_resource.last_write)
-                                        .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
-                                        .dst_access_mask(vk::AccessFlags2::MEMORY_READ)
-                                        .offset(0)
-                                        .dst_stage_mask(match bind_point {
-                                            Some(vk::PipelineBindPoint::COMPUTE) => {
-                                                vk::PipelineStageFlags2::COMPUTE_SHADER
-                                            }
-                                            Some(vk::PipelineBindPoint::RAY_TRACING_KHR) => {
-                                                vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
-                                            }
-                                            Some(vk::PipelineBindPoint::GRAPHICS) => {
-                                                vk::PipelineStageFlags2::VERTEX_SHADER
-                                            } //TODO
-                                            _ => vk::PipelineStageFlags2::TOP_OF_PIPE,
-                                        })
-                                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED),
-                                );
-                            }
-                            ResourceData::Image(image) => {
-                                let mut info = vk::ImageMemoryBarrier2::default()
-                                    .image(image.image.image)
-                                    .src_stage_mask(sync_resource.last_write)
-                                    .subresource_range(
-                                        vk::ImageSubresourceRange::default()
-                                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                            .base_array_layer(0)
-                                            .base_mip_level(0)
-                                            .layer_count(1)
-                                            .level_count(1),
-                                    )
-                                    .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
-                                    .dst_access_mask(vk::AccessFlags2::MEMORY_READ)
-                                    .dst_stage_mask(match bind_point {
-                                        Some(vk::PipelineBindPoint::COMPUTE) => {
-                                            vk::PipelineStageFlags2::COMPUTE_SHADER
-                                        }
-                                        Some(vk::PipelineBindPoint::RAY_TRACING_KHR) => {
-                                            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
-                                        }
-                                        Some(vk::PipelineBindPoint::GRAPHICS) => {
-                                            vk::PipelineStageFlags2::VERTEX_SHADER
-                                        } //TODO
-                                        _ => vk::PipelineStageFlags2::TOP_OF_PIPE,
-                                    })
-                                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED);
-
-                                if let Some(old_layout) = sync_resource.old_layout
-                                    && let Some(new_layout) = sync_resource.new_layout
-                                {
-                                    info = info.old_layout(old_layout).new_layout(new_layout);
-                                }
-
-                                images.push(info);
-                            }
-                        }
-                    }
-
-                    let dependency_info = vk::DependencyInfo::default()
-                        .buffer_memory_barriers(&buffers)
-                        .image_memory_barriers(&images)
-                        .dependency_flags(vk::DependencyFlags::empty());
-
-                    let lable_message = &format!(
-                        "Barrier for {}\0",
-                        pass.sync_resources
-                            .iter()
-                            .fold("".to_owned(), |acc, e| format!(
-                                "{}, {}",
-                                acc,
-                                e.resource_key.as_str()
-                            ))
-                    );
-                    let label = vk::DebugUtilsLabelEXT::default()
-                        .label_name(CStr::from_bytes_with_nul(lable_message.as_bytes()).unwrap())
-                        .color([1.0, 1.0, 1.0, 1.0]);
-                    ctx.debug_utils
-                        .cmd_insert_debug_utils_label(frame.cmd, &label);
-
-                    ctx.device
-                        .cmd_pipeline_barrier2(frame.cmd, &dependency_info);
-                }
-
-                if let Some(bind_point) = bind_point {
-                    let mut descriptor_sets = Vec::new();
-                    if pass.bindless_descriptor {
-                        descriptor_sets.push(self.static_descriptor_set);
-                    }
-                    if let Some(descriptor) = pass.descriptor_set {
-                        descriptor_sets.push(descriptor);
-                    }
-                    if let Some(temporal_descriptors) = pass.temporal_descriptor_sets {
-                        descriptor_sets.push(temporal_descriptors[self.frame_number as usize % 2]);
-                    }
-                    if let Some(temporal_descriptors2) = pass.temporal_descriptor_sets2 {
-                        descriptor_sets.push(temporal_descriptors2[self.frame_number as usize % 2]);
-                    }
-
-                    if !descriptor_sets.is_empty() {
-                        ctx.device.cmd_bind_descriptor_sets(
-                            frame.cmd,
-                            bind_point,
-                            pass.layout,
-                            0,
-                            &descriptor_sets,
-                            &[],
-                        );
-                    }
-                    ctx.device
-                        .cmd_bind_pipeline(frame.cmd, bind_point, pass.pipeline);
-                }
-
-                let label = vk::DebugUtilsLabelEXT::default()
-                    .label_name(CStr::from_ptr(pass.name.as_ptr() as _))
-                    .color([1.0, 1.0, 1.0, 1.0]);
-                ctx.debug_utils
-                    .cmd_insert_debug_utils_label(frame.cmd, &label);
-
-                match &pass.command {
-                    RenderPassCommand::Compute { x, y, z } => {
-                        ctx.device.cmd_dispatch(frame.cmd, *x, *y, *z);
-                    }
-                    RenderPassCommand::Raster {} => {}
-                    RenderPassCommand::Raytracing {
-                        x,
-                        y,
-                        shader_binding_table,
-                    } => {
-                        let call_region = vk::StridedDeviceAddressRegionKHR::default();
-                        raytracing_ctx.pipeline_fn.cmd_trace_rays(
-                            frame.cmd,
-                            &shader_binding_table.raygen_region,
-                            &shader_binding_table.miss_region,
-                            &shader_binding_table.hit_region,
-                            &call_region,
-                            *x,
-                            *y,
-                            1,
-                        );
-                    }
-                    RenderPassCommand::ComputeIndirect { indirect_buffer } => {
-                        ctx.device
-                            .cmd_dispatch_indirect(frame.cmd, *indirect_buffer, 0);
-                    }
-                    RenderPassCommand::Custom(func) => {
-                        func(&frame.cmd, &pass);
-                    }
-                }
-            }
-
-            let copy_image = |image: &ImageResource| {
-                let image_barriers = [
-                    self.static_resources.swapchain.images[swapchain_image_index as usize]
-                        .image
-                        .memory_barrier(
-                            vk::ImageLayout::UNDEFINED,
-                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        ),
-                    image.image.memory_barrier(
-                        vk::ImageLayout::GENERAL,
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    ),
-                ];
-                let dependency_info =
-                    vk::DependencyInfo::default().image_memory_barriers(&image_barriers);
-                ctx.device
-                    .cmd_pipeline_barrier2(frame.cmd, &dependency_info);
-
-                image.image.blit(
-                    &ctx,
-                    &frame.cmd,
-                    &self.static_resources.swapchain.images[swapchain_image_index as usize].image,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                );
-
-                let image_barriers = [
-                    self.static_resources.swapchain.images[swapchain_image_index as usize]
-                        .image
-                        .memory_barrier(
-                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                            vk::ImageLayout::PRESENT_SRC_KHR,
-                        ),
-                    image.image.memory_barrier(
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                        vk::ImageLayout::GENERAL,
-                    ),
-                ];
-                let dependency_info =
-                    vk::DependencyInfo::default().image_memory_barriers(&image_barriers);
-                ctx.device
-                    .cmd_pipeline_barrier2(frame.cmd, &dependency_info);
-            };
-
-            if let Some(entry) = self.resources.get(&self.back_buffer) {
-                match &entry.handle {
-                    ResourceTemporal::Single(res) => match res {
-                        ResourceData::Buffer(_) => {
-                            panic!("Back Buffer is Buffer")
-                        }
-                        ResourceData::Image(image) => copy_image(image),
-                    },
-                    ResourceTemporal::Temporal(res) => match &res[(self.frame_number % 2) as usize]
-                    {
-                        ResourceData::Buffer(_) => {
-                            panic!("Back Buffer is Buffer")
-                        }
-                        ResourceData::Image(image) => copy_image(image),
-                    },
-                }
-            }
-        }
-    }
-
-    fn submit_frame(&mut self, ctx: &Context, frame_in_flight: u64, swapchain_image_index: u32) {
-        let frame = &mut self.frame_data[frame_in_flight as usize];
-
-        unsafe { ctx.device.end_command_buffer(frame.cmd).unwrap() };
-
-        let wait_semaphores = [vk::SemaphoreSubmitInfo::default()
-            .semaphore(
-                self.static_resources.swapchain.frame_resources[frame_in_flight as usize]
-                    .image_availible_semaphore,
-            )
-            .stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)];
-
-        let signal_frame_value = frame.frame_number + FRAMES_IN_FLIGHT;
-        frame.frame_number = signal_frame_value;
-
-        let signal_semaphores = [
-            vk::SemaphoreSubmitInfo::default()
-                .semaphore(
-                    self.static_resources.swapchain.frame_resources[frame_in_flight as usize]
-                        .render_finished_semaphore,
-                )
-                .stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE),
-            vk::SemaphoreSubmitInfo::default()
-                .semaphore(self.static_resources.frame_timeline_semaphore)
-                .stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)
-                .value(signal_frame_value),
-        ];
-
-        let command_buffers = [vk::CommandBufferSubmitInfo::default().command_buffer(frame.cmd)];
-
-        let submit = vk::SubmitInfo2::default()
-            .command_buffer_infos(&command_buffers)
-            .signal_semaphore_infos(&signal_semaphores)
-            .wait_semaphore_infos(&wait_semaphores);
-
-        unsafe {
-            ctx.device
-                .queue_submit2(ctx.graphics_queue, &[submit], vk::Fence::null())
-                .unwrap()
-        };
-
-        let binding = [
-            self.static_resources.swapchain.frame_resources[frame_in_flight as usize]
-                .render_finished_semaphore,
-        ];
-        let swapchains = [self.static_resources.swapchain.vk_swapchain];
-        let image_indices = [swapchain_image_index];
-        let present_info = vk::PresentInfoKHR::default()
-            .image_indices(&image_indices)
-            .swapchains(&swapchains)
-            .wait_semaphores(&binding);
-        unsafe {
-            self.static_resources
-                .swapchain
-                .ash_swapchain
-                .queue_present(ctx.graphics_queue, &present_info)
-                .unwrap()
-        };
-        self.frame_number += 1;
-    }
-
-    fn render_imgui(
-        &mut self,
-        ctx: &Context,
-        draw_data: &imgui::DrawData,
-        cmd: vk::CommandBuffer,
-        swapchain_image_index: u32,
-    ) {
-        unsafe {
-            let begin_info = vk::RenderPassBeginInfo::default()
-                .framebuffer(
-                    self.static_resources.imgui_resources.frame_buffers
-                        [swapchain_image_index as usize],
-                )
-                .render_pass(self.static_resources.imgui_resources.renderpass)
-                .render_area(
-                    vk::Rect2D::default()
-                        .extent(vk::Extent2D {
-                            width: WINDOW_SIZE.x as u32,
-                            height: WINDOW_SIZE.y as u32,
-                        })
-                        .offset(vk::Offset2D { x: 0, y: 0 }),
-                );
-            ctx.device
-                .cmd_begin_render_pass(cmd, &begin_info, vk::SubpassContents::INLINE);
-            self.static_resources
-                .imgui_resources
-                .renderer
-                .cmd_draw(cmd, draw_data)
-                .unwrap();
-            ctx.device.cmd_end_render_pass(cmd);
-        }
-    }
-
-    //TODO Error Handeling
-    pub fn draw(
-        &mut self,
-        ctx: &Context,
-        raytracing_ctx: &RayTracingContext,
-        draw_data: &imgui::DrawData,
-    ) {
-        let frame_in_flight = self.frame_number % FRAMES_IN_FLIGHT;
-        let swapchain_image_index = self.begin_frame(ctx, frame_in_flight);
-
-        self.execute_passes(ctx, raytracing_ctx, frame_in_flight, swapchain_image_index);
-        self.render_imgui(
-            ctx,
-            draw_data,
-            self.frame_data[frame_in_flight as usize].cmd,
-            swapchain_image_index,
-        );
-        self.submit_frame(ctx, frame_in_flight, swapchain_image_index);
-    }
-
-    pub fn toggle_pass(&mut self, pass: &str, value: bool) {
-        self.passes
-            .iter_mut()
-            .find(|e| e.name == pass)
-            .unwrap()
-            .active = value;
-        self.build_sync_resources();
-    }
-}
-
-#[derive(Default)]
-pub struct FrameBuilder<'a> {
-    back_buffer: String,
-    passes: Vec<PassBuilder<'a>>,
-}
-
-impl<'b> FrameBuilder<'b> {
-    pub fn add_pass(mut self, pass: PassBuilder<'b>) -> Self {
-        self.passes.push(pass);
-        self
-    }
-    pub fn set_back_buffer_source(mut self, back_buffer: &str) -> Self {
-        self.back_buffer = back_buffer.to_owned();
-        self
-    }
-}
-
-pub struct PassBuilder<'a> {
-    input_resources: Vec<String>,
-    temporal_resources: Vec<String>,
-    output_resources: Vec<String>,
-    bindless_descriptor: bool,
-    name: String,
-    active: bool,
-    ty: PassBuilderType<'a>,
-}
-
-enum PassBuilderType<'a> {
-    Raytracing(RayTracingPassBuilder<'a>),
-    Compute(ComputePassBuilder<'a>),
-}
-
-impl<'b> PassBuilder<'b> {
-    pub fn read(mut self, value: &'b str) -> Self {
-        if self.input_resources.contains(&value.to_owned()) {
-            panic!("Resource already in input resources")
-        }
-        self.input_resources.push(value.to_owned());
-        self
-    }
-    pub fn read_previous(mut self, value: &'b str) -> Self {
-        if self.temporal_resources.contains(&value.to_owned()) {
-            panic!("Resource already in temporal resources")
-        }
-        self.temporal_resources.push(value.to_owned());
-        self
-    }
-    pub fn write(mut self, value: &'b str) -> Self {
-        if self.output_resources.contains(&value.to_owned()) {
-            panic!("Resource already in output resources")
-        }
-        self.output_resources.push(value.to_owned());
-        self
-    }
-    pub fn bindles_descriptor(mut self, value: bool) -> Self {
-        self.bindless_descriptor = value;
-        self
-    }
-    pub fn toggle_active(mut self, value: bool) -> Self {
-        self.active = value;
-        self
-    }
-
-    pub fn new_compute(name: &str, builder: ComputePassBuilder<'b>) -> Self {
-        Self {
-            ty: PassBuilderType::Compute(builder),
-            bindless_descriptor: false,
-            input_resources: Vec::new(),
-            output_resources: Vec::new(),
-            temporal_resources: Vec::new(),
-            name: name.to_owned(),
-            active: true,
-        }
-    }
-    pub fn new_raytracing(name: &str, builder: RayTracingPassBuilder<'b>) -> Self {
-        Self {
-            ty: PassBuilderType::Raytracing(builder),
-            bindless_descriptor: false,
-            input_resources: Vec::new(),
-            output_resources: Vec::new(),
-            temporal_resources: Vec::new(),
-            name: name.to_owned(),
-            active: true,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum ComputePassBuilderCommand {
-    Dispatch { x: u32, y: u32, z: u32 },
-    DispatchIndirect(vk::Buffer),
-}
-
-impl Default for ComputePassBuilderCommand {
-    fn default() -> Self {
-        ComputePassBuilderCommand::Dispatch { x: 0, y: 0, z: 0 }
-    }
-}
-
-#[derive(Default)]
-pub struct ComputePassBuilder<'a> {
-    shader_source: &'a str,
-    dispatch: ComputePassBuilderCommand,
-}
-
-impl<'b> ComputePassBuilder<'b> {
-    pub fn shader(mut self, src: &'b str) -> Self {
-        self.shader_source = src;
-        self
-    }
-    pub fn dispatch(mut self, x: u32, y: u32, z: u32) -> Self {
-        self.dispatch = ComputePassBuilderCommand::Dispatch { x, y, z };
-        self
-    }
-    pub fn dispatch_indirect(mut self, buffer: Buffer) -> Self {
-        self.dispatch = ComputePassBuilderCommand::DispatchIndirect(buffer.buffer);
-        self
-    }
-}
-
-#[derive(Default)]
-pub struct RayTracingPassBuilder<'a> {
-    launch_size: [u32; 2],
-    ray_gen_source: &'a str,
-    override_hit_shader_source: Option<&'a str>,
-    override_miss_shader_source: Option<&'a str>,
-}
-
-impl<'b> RayTracingPassBuilder<'b> {
-    pub fn raygen_shader(mut self, src: &'b str) -> Self {
-        self.ray_gen_source = src;
-        self
-    }
-    pub fn raymiss_shader(mut self, src: &'b str) -> Self {
-        self.override_miss_shader_source = Some(src);
-        self
-    }
-    pub fn rayhit_shader(mut self, src: &'b str) -> Self {
-        self.override_hit_shader_source = Some(src);
-        self
-    }
-    pub fn launch(mut self, x: u32, y: u32) -> Self {
-        self.launch_size = [x, y];
-        self
-    }
-    pub fn launch_fullscreen(mut self) -> Self {
-        self.launch_size = [WINDOW_SIZE.x as u32, WINDOW_SIZE.y as u32];
-        self
     }
 }

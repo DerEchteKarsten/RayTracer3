@@ -25,7 +25,8 @@ pub struct Swapchain {
 }
 
 impl Swapchain {
-    pub fn new(ctx: &Context) -> Result<Self> {
+    pub fn new() -> Result<Self> {
+        let ctx = Context::get();
         let format = {
             let formats = unsafe {
                 ctx.surface.ash.get_physical_device_surface_formats(
