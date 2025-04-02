@@ -87,7 +87,7 @@ fn main() {
         }))
         .unwrap();
 
-    Context::init(&window, &window);
+    Context::init(&window, &window).unwrap();
     RayTracingContext::init();
 
     let model = model_thread.join().unwrap();
@@ -303,12 +303,15 @@ fn main() {
             .read("Light")
             .write("Out"),
         )
-        .add_pass(PassBuilder::new_raster("Gizzmos", RasterizationPassBuilder::default()
-            .attachment("Out")
-            .depth_attachment("GBufferDepth")
-            .mesh_shader("gizzmos.slang.spv")
-            .fragment_shader("gizzmos.slang.spv"))
-        )
+        // .add_pass(PassBuilder::new_raster("Gizzmos", RasterizationPassBuilder::default()
+        //     .attachment("Out")
+        //     .depth_attachment("GBufferDepth")
+        //     .mesh_shader("gizzmos.slang.spv")
+        //     .mesh_entry("mesh")
+        //     .fragment_entry("fragment")
+        //     .fragment_shader("gizzmos.slang.spv")
+        //     .dispatch(1, 1, 1))
+        // )
         .set_back_buffer_source("Out");
 
     render_graph.compile(frame);

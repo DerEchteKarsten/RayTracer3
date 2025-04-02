@@ -3,7 +3,7 @@ use std::{
 };
 
 use anyhow::Result;
-use ash::{ext::debug_utils, khr::*, vk, Device, Entry, Instance};
+use ash::{ext::{debug_utils, extended_dynamic_state3, mesh_shader}, khr::*, vk, Device, Entry, Instance};
 use gpu_allocator::{
     vulkan::{Allocator, AllocatorCreateDesc},
     AllocationSizes, AllocatorDebugSettings,
@@ -33,6 +33,7 @@ pub struct Context {
     pub(crate) command_pool: vk::CommandPool,
     pub(crate) debug_utils: ash::ext::debug_utils::Device,
     pub(crate) _entry: ash::Entry,
+    pub(crate) mesh_fn: ash::ext::mesh_shader::Device,
 }
 
 static mut CONTEXT: MaybeUninit<Context> = MaybeUninit::uninit();
@@ -58,7 +59,7 @@ impl Context {
         }
     }
 
-    const DEVICE_EXTENSIONS: [&'static CStr; 11] = [
+    const DEVICE_EXTENSIONS: [&'static CStr; 13] = [
         swapchain::NAME,
         ray_tracing_pipeline::NAME,
         acceleration_structure::NAME,
@@ -70,6 +71,8 @@ impl Context {
         shader_float_controls::NAME,
         shader_non_semantic_info::NAME,
         synchronization2::NAME,
+        mesh_shader::NAME,
+        extended_dynamic_state3::NAME,
     ];
 
     unsafe extern "system" fn vulkan_debug_callback(
@@ -219,6 +222,7 @@ impl Context {
         let debug_utils = debug_utils::Device::new(&instance, &device);
 
         Ok(Self {
+            mesh_fn: mesh_shader::Device::new(&instance, &device),
             allocator,
             surface: Surface {
                 ash: ash_surface,
@@ -346,12 +350,28 @@ impl Context {
             .fragment_stores_and_atomics(true)
             .shader_int16(true);
 
+        let mut mesh_shading = vk::PhysicalDeviceMeshShaderFeaturesEXT::default()
+            .task_shader(true)
+            .mesh_shader(true);
+        let mut dynamic_state = vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT::default()
+            .extended_dynamic_state3_depth_clamp_enable(true)
+            .extended_dynamic_state3_polygon_mode(true)
+            .extended_dynamic_state3_logic_op_enable(true)
+            .extended_dynamic_state3_color_blend_equation(true)
+            .extended_dynamic_state3_color_write_mask(true)
+            .extended_dynamic_state3_color_blend_enable(true);
+        let mut dynamic_state2 = vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT::default()
+            .extended_dynamic_state2_logic_op(true);
+
         let mut features = vk::PhysicalDeviceFeatures2::default()
             .features(features)
             .push_next(&mut vulkan_12_features)
             .push_next(&mut vulkan_13_features)
             .push_next(&mut ray_tracing_feature)
-            .push_next(&mut acceleration_struct_feature);
+            .push_next(&mut acceleration_struct_feature)
+            .push_next(&mut mesh_shading)
+            .push_next(&mut dynamic_state)
+            .push_next(&mut dynamic_state2);
         // .push_next(&mut atomics);
 
         let device_extensions_as_ptr = required_extensions
@@ -472,7 +492,7 @@ impl Context {
                 SHADER_CACHE.write(HashMap::new());
             });
             let cache = SHADER_CACHE.assume_init_mut();
-            
+
             match cache.get(code_path) {
                 Some(module) => Ok(*module),
                 None => {
@@ -488,16 +508,16 @@ impl Context {
         }
     }
     
-    pub fn create_shader_stage(
+    pub fn create_shader_stage<'a>(
         &self,
         stage: vk::ShaderStageFlags,
-        path: &str,
-        main: &'static str,
-    ) -> Result<vk::PipelineShaderStageCreateInfo> {
+        path: &'a str,
+        main: &'a str,
+    ) -> Result<vk::PipelineShaderStageCreateInfo<'a>> {
         let module = self.create_shader_module(path)?;
         Ok(vk::PipelineShaderStageCreateInfo::default()
             .stage(stage)
             .module(module)
-            .name(CStr::from_bytes_until_nul(main.as_bytes())?))
+            .name(CStr::from_bytes_with_nul(main.as_bytes())?))
     }
 }

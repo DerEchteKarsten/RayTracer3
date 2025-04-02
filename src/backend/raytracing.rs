@@ -22,7 +22,7 @@ pub struct RayTracingShaderGroupInfo {
 }
 #[derive(Debug, Clone)]
 pub struct RayTracingShaderCreateInfo<'a> {
-    pub source: &'a [(&'a str, vk::ShaderStageFlags)],
+    pub source: &'a [(&'a str, &'a str, vk::ShaderStageFlags)],
     pub group: RayTracingShaderGroup,
 }
 
@@ -116,8 +116,7 @@ impl RayTracingContext {
         };
 
         let buffer = Buffer::new(
-            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
-                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR,
             MemoryLocation::GpuOnly,
             build_size.acceleration_structure_size,
         )?;
@@ -132,7 +131,7 @@ impl RayTracingContext {
         };
 
         let scratch_buffer = Buffer::new_aligned(
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
             MemoryLocation::GpuOnly,
             build_size.build_scratch_size,
             Some(
@@ -189,7 +188,6 @@ impl RayTracingContext {
         let mut stages = vec![];
         let mut groups = vec![];
 
-        let entry_point_name: CString = CString::new("main").unwrap();
 
         for shader in shaders_create_info.iter() {
             let mut this_modules = vec![];
@@ -198,9 +196,9 @@ impl RayTracingContext {
             shader.source.into_iter().for_each(|s| {
                 let module = ctx.create_shader_module(s.0).unwrap();
                 let stage = vk::PipelineShaderStageCreateInfo::default()
-                    .stage(s.1)
+                    .stage(s.2)
                     .module(module)
-                    .name(&entry_point_name);
+                    .name(std::ffi::CStr::from_bytes_until_nul(s.1.as_bytes()).unwrap());
                 this_modules.push(module);
                 this_stages.push(stage);
             });

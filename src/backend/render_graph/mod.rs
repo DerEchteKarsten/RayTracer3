@@ -254,6 +254,9 @@ enum RenderPassCommand{
         depth_attachment: Option<DepthStencilAttachment>,
         stencil_attachment: Option<DepthStencilAttachment>,
         render_area: UVec2,
+        x: u32,
+        y: u32,
+        z: u32,
     },
     Compute {
         x: u32,
@@ -319,4 +322,17 @@ pub enum ImageSize {
     Custom { x: u32, y: u32 },
     Viewport,
     ViewportFraction { x: f32, y: f32 },
+}
+
+impl ImageSize {
+    fn raw(self) -> (u32, u32) {
+        match self {
+            ImageSize::Custom { x, y } => (x, y),
+            ImageSize::Viewport => (WINDOW_SIZE.x as u32, WINDOW_SIZE.y as u32),
+            ImageSize::ViewportFraction { x, y } => (
+                (WINDOW_SIZE.x as f32 * x).ceil() as u32,
+                (WINDOW_SIZE.y as f32 * y).ceil() as u32,
+            ),
+        }
+    }
 }

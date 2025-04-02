@@ -301,16 +301,10 @@ impl RenderGraph {
     ) -> &mut Self {
         let ctx = Context::get();
 
-        let (width, height) = match size {
-            ImageSize::Custom { x, y } => (x, y),
-            ImageSize::Viewport => (WINDOW_SIZE.x as u32, WINDOW_SIZE.y as u32),
-            ImageSize::ViewportFraction { x, y } => (
-                (WINDOW_SIZE.x as f32 * x).ceil() as u32,
-                (WINDOW_SIZE.y as f32 * y).ceil() as u32,
-            ),
-        };
+        let (width, height) = size.raw();
+
         let image = ImageResource::new_2d(
-            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+            vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::STORAGE,
             gpu_allocator::MemoryLocation::GpuOnly,
             format,
             width,
@@ -322,6 +316,90 @@ impl RenderGraph {
             let binding = [image
                 .image
                 .memory_barrier(vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL)];
+            let dependency_info = vk::DependencyInfo::default().image_memory_barriers(&binding);
+            unsafe { ctx.device.cmd_pipeline_barrier2(*cmd, &dependency_info) };
+        })
+        .unwrap();
+
+        let label = vk::DebugUtilsObjectNameInfoEXT::default()
+            .object_handle(image.image.image)
+            .object_name(unsafe { CStr::from_ptr(name.to_string().as_ptr() as _) });
+        unsafe { ctx.debug_utils.set_debug_utils_object_name(&label) }.unwrap();
+
+        self.resources.insert(
+            name.to_string(),
+            Resource {
+                handle: ResourceTemporal::Single(ResourceData::Image(image)),
+                ty: ResourceType::Image,
+            },
+        );
+        self
+    }
+
+    pub fn add_color_attachment_resource(
+        &mut self,
+        name: &str,
+        format: vk::Format,
+        size: ImageSize,
+    ) -> &mut Self {
+        let ctx = Context::get();
+
+        let (width, height) = size.raw();
+        let image = ImageResource::new_2d(
+            vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            gpu_allocator::MemoryLocation::GpuOnly,
+            format,
+            width,
+            height,
+        )
+        .unwrap();
+
+        ctx.execute_one_time_commands(|cmd| {
+            let binding = [image
+                .image
+                .memory_barrier(vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+            let dependency_info = vk::DependencyInfo::default().image_memory_barriers(&binding);
+            unsafe { ctx.device.cmd_pipeline_barrier2(*cmd, &dependency_info) };
+        })
+        .unwrap();
+
+        let label = vk::DebugUtilsObjectNameInfoEXT::default()
+            .object_handle(image.image.image)
+            .object_name(unsafe { CStr::from_ptr(name.to_string().as_ptr() as _) });
+        unsafe { ctx.debug_utils.set_debug_utils_object_name(&label) }.unwrap();
+
+        self.resources.insert(
+            name.to_string(),
+            Resource {
+                handle: ResourceTemporal::Single(ResourceData::Image(image)),
+                ty: ResourceType::Image,
+            },
+        );
+        self
+    }
+
+    pub fn add_depth_attachment_resource(
+        &mut self,
+        name: &str,
+        format: vk::Format,
+        size: ImageSize,
+    ) -> &mut Self {
+        let ctx = Context::get();
+
+        let (width, height) = size.raw();
+        let image = ImageResource::new_2d(
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            gpu_allocator::MemoryLocation::GpuOnly,
+            format,
+            width,
+            height,
+        )
+        .unwrap();
+
+        ctx.execute_one_time_commands(|cmd| {
+            let binding = [image
+                .image
+                .memory_barrier(vk::ImageLayout::UNDEFINED, vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)];
             let dependency_info = vk::DependencyInfo::default().image_memory_barriers(&binding);
             unsafe { ctx.device.cmd_pipeline_barrier2(*cmd, &dependency_info) };
         })
@@ -642,12 +720,15 @@ impl RenderGraph {
 
             let (command, pipeline) = match &pass.ty {
                 PassBuilderType::Compute(compute_pass) => {
+                    let entry = format!("{}\0", compute_pass.entry_name.clone().unwrap_or("main".to_string()));
+                    let path = format!("./shaders/bin/{}", compute_pass.shader_source);
                     let create_infos = vk::ComputePipelineCreateInfo::default()
                         .layout(layout)
                         .stage(
                             ctx.create_shader_stage(
                                 vk::ShaderStageFlags::COMPUTE,
-                                format!("./shaders/bin/{}", compute_pass.shader_source).as_str(),
+                                path.as_str(),
+                                entry.as_str(),
                             )
                             .unwrap(),
                         );
@@ -677,21 +758,24 @@ impl RenderGraph {
                             &[
                                 RayTracingShaderCreateInfo {
                                     source: &[(
-                                        raytracing_pass.ray_gen_source,
+                                        format!("./shaders/bin/{}", raytracing_pass.ray_gen_source).as_str(),
+                                        format!("{}\0", raytracing_pass.raygen_entry_name.clone().unwrap_or("main".to_string())).as_str(),
                                         vk::ShaderStageFlags::RAYGEN_KHR,
                                     )],
                                     group: RayTracingShaderGroup::RayGen,
                                 },
                                 RayTracingShaderCreateInfo {
                                     source: &[(
-                                        raytracing_pass.override_miss_shader_source.unwrap_or("./../../../shaders/bin/default_miss.slang.spv"),
+                                        raytracing_pass.override_miss_shader_source.unwrap_or("./shaders/bin/default_miss.slang.spv"),
+                                        format!("{}\0", raytracing_pass.miss_entry_name.clone().unwrap_or("main".to_string())).as_str(),
                                         vk::ShaderStageFlags::MISS_KHR,
                                     )],
                                     group: RayTracingShaderGroup::Miss,
                                 },
                                 RayTracingShaderCreateInfo {
                                     source: &[(
-                                        raytracing_pass.override_miss_shader_source.unwrap_or("./../../../shaders/bin/default_hit.slang.spv"),
+                                        raytracing_pass.override_miss_shader_source.unwrap_or("./shaders/bin/default_hit.slang.spv"),
+                                        format!("{}\0", raytracing_pass.chit_entry_name.clone().unwrap_or("main".to_string())).as_str(),
                                         vk::ShaderStageFlags::CLOSEST_HIT_KHR,
                                     )],
                                     group: RayTracingShaderGroup::Hit,
@@ -771,9 +855,9 @@ impl RenderGraph {
                             vk::DynamicState::LINE_WIDTH,
                             vk::DynamicState::LOGIC_OP_ENABLE_EXT,
                             vk::DynamicState::LOGIC_OP_EXT,
-                            vk::DynamicState::BLEND_CONSTANTS,
                             vk::DynamicState::COLOR_BLEND_EQUATION_EXT,
                             vk::DynamicState::COLOR_WRITE_MASK_EXT,
+                            vk::DynamicState::COLOR_BLEND_ENABLE_EXT,
                             vk::DynamicState::BLEND_CONSTANTS,
                             vk::DynamicState::DEPTH_TEST_ENABLE,
                             vk::DynamicState::DEPTH_WRITE_ENABLE,
@@ -787,24 +871,32 @@ impl RenderGraph {
                     let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
                         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
 
+                    let entry1 = format!("{}\0", raster_pass.mesh_main.clone().unwrap_or("main".to_string()));
+                    let entry1 = entry1.as_str();
+                    let entry2 = format!("{}\0", raster_pass.fragment_main.clone().unwrap_or("main".to_string()));
+                    let entry2 = entry2.as_str();
+                    let path1 = format!("./shaders/bin/{}", raster_pass.mesh_shader);
+                    let path2 = format!("./shaders/bin/{}", raster_pass.fragment_shader);
                     let stages = [
                         ctx.create_shader_stage(
                             vk::ShaderStageFlags::MESH_EXT,
-                            format!("./shaders/bin/{}", raster_pass.mesh_shader).as_str(),
+                            path1.as_str(),
+                            entry1,
                         )
                         .unwrap(),
                         ctx.create_shader_stage(
                             vk::ShaderStageFlags::FRAGMENT,
-                            format!("./shaders/bin/{}", raster_pass.fragment_shader).as_str(),
+                            path2.as_str(),
+                            entry2,
                         )
                         .unwrap()
                     ];
-                    let create_info = vk::GraphicsPipelineCreateInfo::default()
+                    let mut create_info = vk::GraphicsPipelineCreateInfo::default()
                         .stages(&stages)
                         .layout(layout)
                         .dynamic_state(&dynamic_state)
                         .multisample_state(&multisampling);
-                    create_info.push_next(&mut rendering);
+                    create_info = create_info.push_next(&mut rendering);
 
                     let pipeline = unsafe {
                         ctx.device
@@ -821,6 +913,9 @@ impl RenderGraph {
                         depth_attachment,
                         render_area: raster_pass.render_area.unwrap_or(UVec2::new(WINDOW_SIZE.x as u32, WINDOW_SIZE.y as u32)),
                         stencil_attachment,
+                        x: raster_pass.x,
+                        y: raster_pass.y,
+                        z: raster_pass.z,
                     }, pipeline)
                 }
             };

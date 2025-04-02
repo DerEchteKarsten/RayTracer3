@@ -120,6 +120,7 @@ impl Default for ComputePassBuilderCommand {
 pub struct ComputePassBuilder<'a> {
     pub(super) shader_source: &'a str,
     pub(super) dispatch: ComputePassBuilderCommand,
+    pub(super) entry_name: Option<String>,
 }
 
 impl<'b> ComputePassBuilder<'b> {
@@ -135,6 +136,10 @@ impl<'b> ComputePassBuilder<'b> {
         self.dispatch = ComputePassBuilderCommand::DispatchIndirect(buffer.buffer);
         self
     }
+    pub fn entry_name(mut self, name: &str) -> Self { 
+        self.entry_name = Some(name.to_owned());
+        self
+    }
 }
 
 #[derive(Default)]
@@ -143,6 +148,9 @@ pub struct RayTracingPassBuilder<'a> {
     pub(super) ray_gen_source: &'a str,
     pub(super) override_hit_shader_source: Option<&'a str>,
     pub(super) override_miss_shader_source: Option<&'a str>,
+    pub(super) raygen_entry_name: Option<String>,
+    pub(super) miss_entry_name: Option<String>,
+    pub(super) chit_entry_name: Option<String>,
 }
 
 impl<'b> RayTracingPassBuilder<'b> {
@@ -166,27 +174,33 @@ impl<'b> RayTracingPassBuilder<'b> {
         self.launch_size = [WINDOW_SIZE.x as u32, WINDOW_SIZE.y as u32];
         self
     }
-}
-
-#[derive(Default)]
-struct RasterShaderStages<'a> {
-    pub(super) vertex: Option<&'a str>,
-    pub(super) hullshader: Option<&'a str>,
-    pub(super) domainshader: Option<&'a str>,
-    pub(super) geometryshader: Option<&'a str>,
-    pub(super) fragment: Option<&'a str>,
+    pub fn raygen_entry_name(mut self, name: &str) -> Self {
+        self.raygen_entry_name = Some(name.to_owned());
+        self
+    }
+    pub fn miss_entry_name(mut self, name: &str) -> Self {
+        self.miss_entry_name = Some(name.to_owned());
+        self
+    }
+    pub fn chit_entry_name(mut self, name: &str) -> Self {
+        self.chit_entry_name = Some(name.to_owned());
+        self
+    }
 }
 
 #[derive(Default)]
 pub struct RasterizationPassBuilder<'a> {
     pub(super) mesh_shader: &'a str,
     pub(super) fragment_shader: &'a str,
-    pub(super) fragment_main: &'static str,
-    pub(super) mesh_main: &'static str,
+    pub(super) fragment_main: Option<String>,
+    pub(super) mesh_main: Option<String>,
     pub(super) attachments: Vec<(String, Option<[f32; 4]>)>,
     pub(super) depth_attachment: Option<(String, Option<f32>)>,
     pub(super) stencil_attachment: Option<(String, Option<f32>)>,
     pub(super) render_area: Option<UVec2>,
+    pub(super) x: u32,
+    pub(super) y: u32,
+    pub(super) z: u32,
 }
 
 impl<'b> RasterizationPassBuilder<'b> {
@@ -194,12 +208,12 @@ impl<'b> RasterizationPassBuilder<'b> {
         self.mesh_shader = src;
         self
     }
-    pub fn fragment_main(mut self, main: &'static str) -> Self {
-        self.fragment_main = main;
+    pub fn fragment_entry(mut self, main: &str) -> Self {
+        self.fragment_main = Some(main.to_owned());
         self
     }
-    pub fn mesh_main(mut self, main: &'static str) -> Self {
-        self.mesh_main = main;
+    pub fn mesh_entry(mut self, main: &str) -> Self {
+        self.mesh_main = Some(main.to_owned());
         self
     }
     pub fn fragment_shader(mut self, src: &'b str) -> Self {
@@ -232,6 +246,12 @@ impl<'b> RasterizationPassBuilder<'b> {
     }
     pub fn render_area<'a>(mut self, v: [u32; 2]) -> Self {
         self.render_area = Some(v.into());
+        self
+    }
+    pub fn dispatch(mut self, x: u32, y: u32, z: u32) -> Self {
+        self.x = x;
+        self.y = y;
+        self.z = z;
         self
     }
 }

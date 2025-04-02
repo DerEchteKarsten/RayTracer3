@@ -118,6 +118,9 @@ impl PhysicalDevice {
             .runtime_descriptor_array(true)
             .buffer_device_address(true)
             .shader_buffer_int64_atomics(true);
+        let mut mesh_shading = vk::PhysicalDeviceMeshShaderFeaturesEXT::default()
+            .task_shader(true)
+            .mesh_shader(true);
 
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default();
         let mut features2 = vk::PhysicalDeviceFeatures2::default()
@@ -127,7 +130,8 @@ impl PhysicalDevice {
             .push_next(&mut ray_tracing_feature)
             .push_next(&mut acceleration_struct_feature)
             .push_next(&mut features13)
-            .push_next(&mut atomics2);
+            .push_next(&mut atomics2)
+            .push_next(&mut mesh_shading);
         unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
 
         Ok(Self {

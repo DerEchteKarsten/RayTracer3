@@ -3,6 +3,7 @@ use std::ffi::CStr;
 use crate::backend::{raytracing::RayTracingContext, vulkan_context::Context};
 
 use super::*;
+use ash::khr;
 use build::*;
 use compile::*;
 
@@ -207,7 +208,7 @@ impl RenderGraph {
                     RenderPassCommand::Compute { x, y, z } => {
                         ctx.device.cmd_dispatch(frame.cmd,*x, *y, *z);
                     }
-                    RenderPassCommand::Raster {color_attachments, depth_attachment, stencil_attachment, render_area} => {
+                    RenderPassCommand::Raster {color_attachments, depth_attachment, stencil_attachment, render_area, x, y, z} => {
                         let color_attachments = color_attachments.iter().map(|e| {
                             vk::RenderingAttachmentInfo::default()
                                 .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -239,6 +240,8 @@ impl RenderGraph {
                         }
                         
                         ctx.device.cmd_begin_rendering(frame.cmd, &rendering_info);
+                        ctx.mesh_fn.cmd_draw_mesh_tasks(frame.cmd, *x, *y, *z);
+                        ctx.device.cmd_end_rendering(frame.cmd);
                     }
                     RenderPassCommand::Raytracing {
                         x,
@@ -386,7 +389,7 @@ impl RenderGraph {
             self.static_resources
                 .swapchain
                 .ash_swapchain
-                .queue_present(ctx.graphics_queue, &present_info)
+                .queue_present(ctx.present_queue, &present_info)
                 .unwrap()
         };
         self.frame_number += 1;
