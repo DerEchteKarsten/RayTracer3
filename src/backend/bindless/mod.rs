@@ -1,13 +1,19 @@
+use std::mem::MaybeUninit;
+
 use anyhow::{Ok, Result};
 use ash::vk;
 
-use super::{raytracing::RayTracingContext, utils::Buffer, vulkan_context::Context};
+use super::{
+    raytracing::RayTracingContext,
+    utils::{Buffer, Image, ImageResource},
+    vulkan_context::Context,
+};
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash)]
 #[repr(transparent)]
-pub struct RenderResourceHandle(u32);
+pub struct DescriptorResourceHandle(u32);
 
-impl RenderResourceHandle {
+impl DescriptorResourceHandle {
     fn bump_version_and_update_tag(self, tag: RenderResourceTag) -> Self {
         self
     }
@@ -32,19 +38,24 @@ enum RenderResourceTag {
     AccelerationStructure,
 }
 
-impl RenderResourceHandle {
-    pub fn new(_version: u8, _tag: RenderResourceTag, index: u32, _access_type: AccessType) -> Self {
+impl DescriptorResourceHandle {
+    pub fn new(
+        _version: u8,
+        _tag: RenderResourceTag,
+        index: u32,
+        _access_type: AccessType,
+    ) -> Self {
         Self(index)
     }
 }
 
-struct BindlessDescriptorHeap {
-    available_recycled_descriptors: Vec<RenderResourceHandle>,
+pub struct BindlessDescriptorHeap {
+    available_recycled_descriptors: Vec<DescriptorResourceHandle>,
     descriptor_pool: vk::DescriptorPool,
     descriptor_index: u32,
     set_layouts: [vk::DescriptorSetLayout; 4],
     sets: [vk::DescriptorSet; 4],
-    layout: vk::PipelineLayout
+    pub layout: vk::PipelineLayout,
 }
 
 #[derive(PartialEq)]
@@ -55,17 +66,26 @@ enum BindlessTableType {
     AccelerationStructures,
 }
 
+static mut BINDLESS: MaybeUninit<BindlessDescriptorHeap> = MaybeUninit::uninit();
+
 impl BindlessTableType {
     fn all_tables() -> [BindlessTableType; 4] {
-        [BindlessTableType::Buffers, BindlessTableType::Images, BindlessTableType::Textures, BindlessTableType::AccelerationStructures]
+        [
+            BindlessTableType::Buffers,
+            BindlessTableType::Images,
+            BindlessTableType::Textures,
+            BindlessTableType::AccelerationStructures,
+        ]
     }
 
     fn to_vk(&self) -> vk::DescriptorType {
         match self {
-            BindlessTableType::AccelerationStructures => vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
+            BindlessTableType::AccelerationStructures => {
+                vk::DescriptorType::ACCELERATION_STRUCTURE_KHR
+            }
             BindlessTableType::Buffers => vk::DescriptorType::STORAGE_BUFFER,
             BindlessTableType::Images => vk::DescriptorType::STORAGE_IMAGE,
-            BindlessTableType::Textures => vk::DescriptorType::SAMPLED_IMAGE
+            BindlessTableType::Textures => vk::DescriptorType::SAMPLED_IMAGE,
         }
     }
 
@@ -83,27 +103,39 @@ impl BindlessTableType {
         let raytracing_ctx = RayTracingContext::get();
 
         match self {
-            BindlessTableType::Buffers => ctx.physical_device.limits.max_descriptor_set_storage_buffers,
-            BindlessTableType::Images => ctx.physical_device.limits.max_descriptor_set_storage_images,
-            BindlessTableType::Textures => ctx.physical_device.limits.max_descriptor_set_sampled_images,
-            BindlessTableType::AccelerationStructures => raytracing_ctx.acceleration_structure_properties.max_descriptor_set_acceleration_structures,
+            BindlessTableType::Buffers => {
+                ctx.physical_device
+                    .limits
+                    .max_descriptor_set_storage_buffers
+            }
+            BindlessTableType::Images => {
+                ctx.physical_device.limits.max_descriptor_set_storage_images
+            }
+            BindlessTableType::Textures => {
+                ctx.physical_device.limits.max_descriptor_set_sampled_images
+            }
+            BindlessTableType::AccelerationStructures => {
+                raytracing_ctx
+                    .acceleration_structure_properties
+                    .max_descriptor_set_acceleration_structures
+            }
         }
     }
 
     pub fn descriptor_pool_sizes(immutable_sampler_count: u32) -> Vec<vk::DescriptorPoolSize> {
         let mut type_histogram = std::collections::HashMap::new();
-    
+
         for table in Self::all_tables().iter() {
             type_histogram
                 .entry(table.to_vk())
                 .and_modify(|v| *v += table.table_size())
                 .or_insert_with(|| table.table_size());
         }
-    
+
         type_histogram
             .entry(Self::Textures.to_vk())
             .and_modify(|v| *v += immutable_sampler_count);
-    
+
         type_histogram
             .iter()
             .map(|(ty, descriptor_count)| vk::DescriptorPoolSize {
@@ -114,9 +146,8 @@ impl BindlessTableType {
     }
 }
 
-
 impl BindlessDescriptorHeap {
-    pub(crate) fn retire_handle(&mut self, handle: RenderResourceHandle) {
+    pub(crate) fn retire_handle(&mut self, handle: DescriptorResourceHandle) {
         self.available_recycled_descriptors.push(handle);
     }
 
@@ -126,28 +157,31 @@ impl BindlessDescriptorHeap {
         index
     }
 
-    fn fetch_available_descriptor(&mut self, tag: RenderResourceTag, access_type: AccessType) -> RenderResourceHandle {
-        self.available_recycled_descriptors
-            .pop()
-            .map_or_else(
-                || RenderResourceHandle::new(0, tag, self.increment_descriptor(), access_type),
-                |recycled_handle| recycled_handle.bump_version_and_update_tag(tag),
-            )
+    fn fetch_available_descriptor(
+        &mut self,
+        tag: RenderResourceTag,
+        access_type: AccessType,
+    ) -> DescriptorResourceHandle {
+        self.available_recycled_descriptors.pop().map_or_else(
+            || DescriptorResourceHandle::new(0, tag, self.increment_descriptor(), access_type),
+            |recycled_handle| recycled_handle.bump_version_and_update_tag(tag),
+        )
     }
 
-    pub fn allocate_buffer_handle(
-        &mut self,
-        buffer: Buffer,
-    ) -> RenderResourceHandle {
+    pub fn allocate_buffer_handle(&mut self, buffer: &Buffer) -> DescriptorResourceHandle {
         let ctx = Context::get();
-        let handle = Self::fetch_available_descriptor(self, RenderResourceTag::Buffer, AccessType::ReadWrite);
-    
+        let handle = Self::fetch_available_descriptor(
+            self,
+            RenderResourceTag::Buffer,
+            AccessType::ReadWrite,
+        );
+
         let buffer_info = vk::DescriptorBufferInfo {
             buffer: buffer.buffer,
             offset: 0,
             range: vk::WHOLE_SIZE,
         };
-    
+
         let write = [vk::WriteDescriptorSet {
             dst_set: self.sets[BindlessTableType::Buffers.set_index()],
             dst_binding: 0,
@@ -160,8 +194,77 @@ impl BindlessDescriptorHeap {
         unsafe {
             ctx.device.update_descriptor_sets(&write, &[]);
         };
-    
+
         handle
+    }
+
+    pub fn allocate_storage_image_handle(
+        &mut self,
+        image: &ImageResource,
+    ) -> DescriptorResourceHandle {
+        let ctx = Context::get();
+        let handle =
+            Self::fetch_available_descriptor(self, RenderResourceTag::Image, AccessType::ReadWrite);
+
+        let image_info = vk::DescriptorImageInfo {
+            image_layout: vk::ImageLayout::GENERAL,
+            sampler: vk::Sampler::null(),
+            image_view: image.view,
+        };
+
+        let write = [vk::WriteDescriptorSet {
+            dst_set: self.sets[BindlessTableType::Images.set_index()],
+            dst_binding: 0,
+            descriptor_count: 1,
+            dst_array_element: handle.index(),
+            descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+            p_image_info: &image_info,
+            ..Default::default()
+        }];
+        unsafe {
+            ctx.device.update_descriptor_sets(&write, &[]);
+        };
+
+        handle
+    }
+
+    pub fn allocate_texture_handle(&mut self, image: &ImageResource) -> DescriptorResourceHandle {
+        let ctx = Context::get();
+        let handle =
+            Self::fetch_available_descriptor(self, RenderResourceTag::Image, AccessType::ReadWrite);
+
+        let image_info = vk::DescriptorImageInfo {
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            sampler: vk::Sampler::null(),
+            image_view: image.view,
+        };
+
+        let write = [vk::WriteDescriptorSet {
+            dst_set: self.sets[BindlessTableType::Images.set_index()],
+            dst_binding: 0,
+            descriptor_count: 1,
+            dst_array_element: handle.index(),
+            descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+            p_image_info: &image_info,
+            ..Default::default()
+        }];
+        unsafe {
+            ctx.device.update_descriptor_sets(&write, &[]);
+        };
+
+        handle
+    }
+
+    pub(crate) fn init(immutable_samplers: &[vk::Sampler]) {
+        unsafe { BINDLESS.write(Self::new(immutable_samplers)) };
+    }
+
+    pub(crate) fn get() -> &'static BindlessDescriptorHeap {
+        unsafe { BINDLESS.assume_init_ref() }
+    }
+
+    pub(crate) fn get_mut() -> &'static mut BindlessDescriptorHeap {
+        unsafe { BINDLESS.assume_init_mut() }
     }
 
     pub(crate) fn new(immutable_samplers: &[vk::Sampler]) -> Self {
@@ -174,14 +277,20 @@ impl BindlessDescriptorHeap {
             .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND)
             .max_sets(4);
 
-        let descriptor_pool = unsafe { ctx.device.create_descriptor_pool(&descriptor_pool_info, None).unwrap() };
+        let descriptor_pool = unsafe {
+            ctx.device
+                .create_descriptor_pool(&descriptor_pool_info, None)
+                .unwrap()
+        };
         let (set_layouts, layout) = Self::create_bindless_layout(immutable_samplers);
-        
+
         let allocate_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(descriptor_pool)
             .set_layouts(&set_layouts);
-        
-        let sets = unsafe { ctx.device.allocate_descriptor_sets(&allocate_info).unwrap() }.try_into().unwrap();
+
+        let sets = unsafe { ctx.device.allocate_descriptor_sets(&allocate_info).unwrap() }
+            .try_into()
+            .unwrap();
 
         Self {
             descriptor_pool,
@@ -193,7 +302,9 @@ impl BindlessDescriptorHeap {
         }
     }
 
-    pub(super) fn create_bindless_layout(immutable_samplers: &[vk::Sampler]) -> ([vk::DescriptorSetLayout; 4], vk::PipelineLayout) {
+    pub(super) fn create_bindless_layout(
+        immutable_samplers: &[vk::Sampler],
+    ) -> ([vk::DescriptorSetLayout; 4], vk::PipelineLayout) {
         let ctx = Context::get();
         let mut descriptor_layouts = [vk::DescriptorSetLayout::null(); 4];
         BindlessTableType::all_tables()
@@ -235,7 +346,8 @@ impl BindlessDescriptorHeap {
                 let mut ext_flags = vk::DescriptorSetLayoutBindingFlagsCreateInfoEXT::default()
                     .binding_flags(&descriptor_binding_flags);
 
-                descriptor_layouts[set_idx] = ctx.device
+                descriptor_layouts[set_idx] = ctx
+                    .device
                     .create_descriptor_set_layout(
                         &vk::DescriptorSetLayoutCreateInfo::default()
                             .bindings(&set)
@@ -261,18 +373,46 @@ impl BindlessDescriptorHeap {
             .set_layouts(&descriptor_layouts)
             .push_constant_ranges(&push_constant_ranges);
 
-        let pipeline_layout = unsafe { ctx.device.create_pipeline_layout(&layout_create_info, None) }
-            .expect("Failed creating pipeline layout.");
+        let pipeline_layout =
+            unsafe { ctx.device.create_pipeline_layout(&layout_create_info, None) }
+                .expect("Failed creating pipeline layout.");
 
         (descriptor_layouts, pipeline_layout)
     }
 
     fn bind(&self, cmd: &vk::CommandBuffer) -> Result<()> {
         let ctx = Context::get();
-        
-        unsafe { ctx.device.cmd_bind_descriptor_sets(*cmd, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &self.sets, &[]) };
-        unsafe { ctx.device.cmd_bind_descriptor_sets(*cmd, vk::PipelineBindPoint::RAY_TRACING_KHR, self.layout, 0, &self.sets, &[]) };
-        unsafe { ctx.device.cmd_bind_descriptor_sets(*cmd, vk::PipelineBindPoint::COMPUTE, self.layout, 0, &self.sets, &[]) };
+
+        unsafe {
+            ctx.device.cmd_bind_descriptor_sets(
+                *cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.layout,
+                0,
+                &self.sets,
+                &[],
+            )
+        };
+        unsafe {
+            ctx.device.cmd_bind_descriptor_sets(
+                *cmd,
+                vk::PipelineBindPoint::RAY_TRACING_KHR,
+                self.layout,
+                0,
+                &self.sets,
+                &[],
+            )
+        };
+        unsafe {
+            ctx.device.cmd_bind_descriptor_sets(
+                *cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.layout,
+                0,
+                &self.sets,
+                &[],
+            )
+        };
 
         Ok(())
     }

@@ -183,9 +183,7 @@ impl Model {
             .min_filter(min_filter)
     }
 
-    pub fn from_gltf(
-        model: gltf::Model,
-    ) -> Result<Self> {
+    pub fn from_gltf(model: gltf::Model) -> Result<Self> {
         let ctx = Context::get();
 
         let vertices = model.vertices.as_slice();
@@ -258,11 +256,7 @@ impl Model {
                     )
                 };
 
-                staging.copy_to_image(
-                    cmd,
-                    &image.image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                );
+                staging.copy_to_image(cmd, &image.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
 
                 unsafe {
                     ctx.device.cmd_pipeline_barrier2(

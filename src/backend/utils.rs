@@ -1,5 +1,3 @@
-use std::{collections::HashMap, ffi::CStr, mem::MaybeUninit, sync::{Arc, Once}};
-use once_cell::sync::Lazy;
 use anyhow::{Ok, Result};
 use ash::vk;
 use gpu_allocator::{
@@ -7,6 +5,13 @@ use gpu_allocator::{
     MemoryLocation,
 };
 use image::{DynamicImage, GenericImageView};
+use once_cell::sync::Lazy;
+use std::{
+    collections::HashMap,
+    ffi::CStr,
+    mem::MaybeUninit,
+    sync::{Arc, Once},
+};
 
 use super::vulkan_context::Context;
 
@@ -437,10 +442,7 @@ impl Buffer {
         Ok(buffer)
     }
 
-    pub(crate) fn from_data<T: Copy>(
-        usage: vk::BufferUsageFlags,
-        data: &[T],
-    ) -> Result<Buffer> {
+    pub(crate) fn from_data<T: Copy>(usage: vk::BufferUsageFlags, data: &[T]) -> Result<Buffer> {
         let size = size_of_val(data) as _;
         Self::from_data_with_size(usage, data, size)
     }
@@ -460,10 +462,7 @@ impl ImageResource {
         Ok(image.new_resource(&ctx.device, extend))
     }
 
-    pub fn new_from_data(
-        image: DynamicImage,
-        format: vk::Format,
-    ) -> Result<Self> {
+    pub fn new_from_data(image: DynamicImage, format: vk::Format) -> Result<Self> {
         let (width, height) = image.dimensions();
         let image_buffer = if format != vk::Format::R8G8B8A8_SRGB {
             let image_data = image.to_rgba32f();
@@ -510,11 +509,7 @@ impl ImageResource {
                 )
             };
 
-            image_buffer.copy_to_image(
-                cmd,
-                &texture_image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            );
+            image_buffer.copy_to_image(cmd, &texture_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
 
             let barrier = texture_image.memory_barrier(
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -594,7 +589,7 @@ pub fn create_sampler(info: &SamplerInfo) -> Result<vk::Sampler> {
             SAMPLER_CACHE.write(Vec::new());
         });
         let cache = SAMPLER_CACHE.assume_init_mut();
-        
+
         match cache.iter().find(|e| e.0 == *info) {
             Some(sampler) => Ok(sampler.1),
             None => {

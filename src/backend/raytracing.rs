@@ -9,8 +9,7 @@ use gpu_allocator::{vulkan::Allocation, MemoryLocation};
 use log::debug;
 
 use super::{
-    utils::{alinged_size, Buffer},
-    vulkan_context::Context,
+    pipeline_cache::PipelineCache, utils::{alinged_size, Buffer}, vulkan_context::Context
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -43,16 +42,15 @@ pub struct AccelerationStructure {
 pub struct RayTracingContext {
     pub pipeline_properties: vk::PhysicalDeviceRayTracingPipelinePropertiesKHR<'static>,
     pub pipeline_fn: ray_tracing_pipeline::Device,
-    pub acceleration_structure_properties: vk::PhysicalDeviceAccelerationStructurePropertiesKHR<'static>,
+    pub acceleration_structure_properties:
+        vk::PhysicalDeviceAccelerationStructurePropertiesKHR<'static>,
     pub acceleration_structure_fn: acceleration_structure::Device,
 }
 static mut RAYTRACING_CONTEXT: MaybeUninit<RayTracingContext> = MaybeUninit::uninit();
 
 impl RayTracingContext {
-    pub fn get() -> &'static RayTracingContext{
-        unsafe {
-            RAYTRACING_CONTEXT.assume_init_ref()
-        }
+    pub fn get() -> &'static RayTracingContext {
+        unsafe { RAYTRACING_CONTEXT.assume_init_ref() }
     }
 
     pub(crate) fn init() {
@@ -177,7 +175,7 @@ impl RayTracingContext {
         &self,
         pipeline_layout: vk::PipelineLayout,
         shaders_create_info: &[RayTracingShaderCreateInfo],
-    ) -> Result<(vk::Pipeline, RayTracingShaderGroupInfo)> {
+    ) -> Result<(vk::Pipeline, ShaderBindingTable)> {
         let ctx = Context::get();
         let mut shader_group_info = RayTracingShaderGroupInfo {
             group_count: shaders_create_info.len() as u32,
@@ -188,13 +186,12 @@ impl RayTracingContext {
         let mut stages = vec![];
         let mut groups = vec![];
 
-
         for shader in shaders_create_info.iter() {
             let mut this_modules = vec![];
             let mut this_stages = vec![];
 
             shader.source.into_iter().for_each(|s| {
-                let module = ctx.create_shader_module(s.0).unwrap();
+                let module = PipelineCache::get_mut().create_shader_module(s.0).unwrap();
                 let stage = vk::PipelineShaderStageCreateInfo::default()
                     .stage(s.2)
                     .module(module)
@@ -261,7 +258,8 @@ impl RayTracingContext {
             )
         }
         .unwrap();
-        Ok((pipeline[0], shader_group_info))
+        let sbt = ShaderBindingTable::new(&pipeline[0], &shader_group_info)?;
+        Ok((pipeline[0], sbt))
     }
 }
 
@@ -273,10 +271,7 @@ pub struct ShaderBindingTable {
 }
 
 impl ShaderBindingTable {
-    pub fn new(
-        pipeline: &vk::Pipeline,
-        shaders: &RayTracingShaderGroupInfo,
-    ) -> Result<Self> {
+    pub fn new(pipeline: &vk::Pipeline, shaders: &RayTracingShaderGroupInfo) -> Result<Self> {
         let ray_tracing = RayTracingContext::get();
         let desc = shaders;
 

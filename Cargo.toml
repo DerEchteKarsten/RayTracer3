@@ -10,6 +10,7 @@ anyhow = "1.0.75"
 ash = { version = "0.38", features = ["loaded", "debug"] }
 ash-window = "0.13.0"
 clippy = "0.0.302"
+derivative = "2.2.0"
 glam = "0.29.2"
 gltf = "1.0"
 gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }

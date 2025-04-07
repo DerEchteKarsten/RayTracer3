@@ -21,7 +21,7 @@ pub struct Swapchain {
     pub color_space: vk::ColorSpaceKHR,
     pub present_mode: vk::PresentModeKHR,
     pub images: Vec<ImageResource>,
-    pub frame_resources: [FrameResources; FRAMES_IN_FLIGHT as usize],
+    pub frame_resources: [FrameResources; FRAMES_IN_FLIGHT],
 }
 
 impl Swapchain {
@@ -137,10 +137,10 @@ impl Swapchain {
             })
             .collect::<Vec<_>>();
 
-        let mut frame_resources: [FrameResources; FRAMES_IN_FLIGHT as usize] =
+        let mut frame_resources: [FrameResources; FRAMES_IN_FLIGHT] =
             unsafe { std::mem::MaybeUninit::uninit().assume_init() };
 
-        for i in 0..FRAMES_IN_FLIGHT as usize {
+        for i in 0..FRAMES_IN_FLIGHT {
             let create_info = vk::SemaphoreCreateInfo::default();
             let image_availible_semaphore =
                 unsafe { ctx.device.create_semaphore(&create_info, None).unwrap() };

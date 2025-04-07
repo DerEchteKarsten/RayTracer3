@@ -11,7 +11,6 @@ use ash::vk;
 use assets::{gltf, model::Model};
 use backend::{
     raytracing::{self, RayTracingContext},
-    render_graph::{build::{ComputePassBuilder, FrameBuilder, PassBuilder, RasterizationPassBuilder, RayTracingPassBuilder}, ImageSize, RenderGraph, ResourceType, SceneResources},
     utils::{create_sampler, Buffer, Image, ImageResource, SamplerInfo},
     vulkan_context::{self, Context},
 };
@@ -94,8 +93,7 @@ fn main() {
     let model = Model::from_gltf(model).unwrap();
 
     let image = image_thread.join().unwrap();
-    let skybox =
-        ImageResource::new_from_data(image, vk::Format::R32G32B32A32_SFLOAT).unwrap();
+    let skybox = ImageResource::new_from_data(image, vk::Format::R32G32B32A32_SFLOAT).unwrap();
 
     let sampler_info = SamplerInfo {
         mag_filter: vk::Filter::LINEAR,
@@ -173,38 +171,38 @@ fn main() {
     let mut render_graph = RenderGraph::new(scene_resources, &mut imgui);
     let swapchain_format = render_graph.swpachain_format();
 
-    render_graph.add_image_resource(
-        "GBuffer",
-        vk::Format::R32G32B32A32_UINT,
-        ImageSize::Viewport,
-    ).add_image_resource(
-        "GBufferDepth",
-        vk::Format::R32_SFLOAT,
-        ImageSize::Viewport,
-    ).add_image_resource(
-        "Out",
-        swapchain_format,
-        ImageSize::Viewport,
-    ).add_temporal_image_resource(
-        "ProbeAtlas",
-        vk::Format::R32G32B32A32_SFLOAT,
-        ImageSize::ViewportFraction { x: 0.5, y: 0.5 },
-    ).add_buffer_resource(
-        "SphericalHarmonics",
-        (WINDOW_SIZE.y as u64 * WINDOW_SIZE.x as u64 * (9 * 4 * 3)).div_ceil(16),
-    ).add_temporal_image_resource(
-        "Light",
-        vk::Format::R32G32B32A32_SFLOAT,
-        ImageSize::Viewport,
-    ).add_image_resource(
-        "TraceDirections",
-        vk::Format::R16_UINT,
-        ImageSize::ViewportFraction { x: 0.5, y: 0.5 },
-    ).add_image_resource(
-        "DebugPDFs",
-        vk::Format::R32_SFLOAT,
-        ImageSize::ViewportFraction { x: 0.5, y: 0.5 },
-    );
+    render_graph
+        .add_image_resource(
+            "GBuffer",
+            vk::Format::R32G32B32A32_UINT,
+            ImageSize::Viewport,
+        )
+        .add_image_resource("GBufferDepth", vk::Format::R32_SFLOAT, ImageSize::Viewport)
+        .add_image_resource("Out", swapchain_format, ImageSize::Viewport)
+        .add_temporal_image_resource(
+            "ProbeAtlas",
+            vk::Format::R32G32B32A32_SFLOAT,
+            ImageSize::ViewportFraction { x: 0.5, y: 0.5 },
+        )
+        .add_buffer_resource(
+            "SphericalHarmonics",
+            (WINDOW_SIZE.y as u64 * WINDOW_SIZE.x as u64 * (9 * 4 * 3)).div_ceil(16),
+        )
+        .add_temporal_image_resource(
+            "Light",
+            vk::Format::R32G32B32A32_SFLOAT,
+            ImageSize::Viewport,
+        )
+        .add_image_resource(
+            "TraceDirections",
+            vk::Format::R16_UINT,
+            ImageSize::ViewportFraction { x: 0.5, y: 0.5 },
+        )
+        .add_image_resource(
+            "DebugPDFs",
+            vk::Format::R32_SFLOAT,
+            ImageSize::ViewportFraction { x: 0.5, y: 0.5 },
+        );
 
     let frame = FrameBuilder::default()
         .add_pass(
