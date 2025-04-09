@@ -1,3 +1,8 @@
+mod physical_device;
+pub(crate) mod raytracing;
+pub mod swapchain;
+pub(crate) mod utils;
+
 use std::{
     cell::LazyCell,
     collections::HashMap,
@@ -17,15 +22,11 @@ use gpu_allocator::{
     vulkan::{Allocator, AllocatorCreateDesc},
     AllocationSizes, AllocatorDebugSettings,
 };
+use physical_device::{PhysicalDevice, QueueFamily};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::{dpi::PhysicalSize, event_loop::EventLoop, window::WindowAttributes};
 
 use crate::WINDOW_SIZE;
-
-use super::{
-    physical_device::{PhysicalDevice, QueueFamily},
-    raytracing::RayTracingContext,
-};
 
 pub struct Surface {
     pub(crate) ash: ash::khr::surface::Instance,
@@ -70,7 +71,7 @@ impl Context {
     }
 
     const DEVICE_EXTENSIONS: [&'static CStr; 13] = [
-        swapchain::NAME,
+        ash::khr::swapchain::NAME,
         ray_tracing_pipeline::NAME,
         acceleration_structure::NAME,
         ash::ext::descriptor_indexing::NAME,

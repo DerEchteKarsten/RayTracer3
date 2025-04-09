@@ -8,8 +8,11 @@ use ash::{
 use gpu_allocator::{vulkan::Allocation, MemoryLocation};
 use log::debug;
 
+use crate::PipelineCache;
+
 use super::{
-    pipeline_cache::PipelineCache, utils::{alinged_size, Buffer}, vulkan_context::Context
+    utils::{alinged_size, Buffer},
+    Context,
 };
 
 #[derive(Debug, Clone, Copy, Default)]

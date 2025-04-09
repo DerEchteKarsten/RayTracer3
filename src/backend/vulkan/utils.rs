@@ -13,11 +13,18 @@ use std::{
     sync::{Arc, Once},
 };
 
-use super::vulkan_context::Context;
+use super::Context;
 
 pub struct Buffer {
     pub(crate) buffer: vk::Buffer,
     pub(crate) allocation: Allocation,
+    pub(crate) address: vk::DeviceAddress,
+    pub(crate) size: vk::DeviceSize,
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct BufferHandle {
+    pub(crate) buffer: vk::Buffer,
     pub(crate) address: vk::DeviceAddress,
     pub(crate) size: vk::DeviceSize,
 }
@@ -37,11 +44,19 @@ pub struct ImageResource {
     pub(crate) extent: vk::Extent2D,
 }
 
-impl Image {
+#[derive(Default, Clone, Copy)]
+pub struct ImageHandle {
+    pub(crate) image: vk::Image,
+    pub(crate) view: vk::ImageView,
+    pub(crate) extent: vk::Extent2D,
+    pub(crate) format: vk::Format,
+}
+
+impl ImageHandle {
     pub fn copy(
         &self,
         cmd: &vk::CommandBuffer,
-        other: &Image,
+        other: &ImageHandle,
         src_layout: vk::ImageLayout,
         dst_layout: vk::ImageLayout,
     ) {
@@ -80,7 +95,7 @@ impl Image {
     pub fn blit(
         &self,
         cmd: &vk::CommandBuffer,
-        other: &Image,
+        other: &ImageHandle,
         src_layout: vk::ImageLayout,
         dst_layout: vk::ImageLayout,
     ) {
@@ -140,7 +155,8 @@ impl Image {
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
                 vk::PipelineStageFlags2::FRAGMENT_SHADER
                     | vk::PipelineStageFlags2::COMPUTE_SHADER
-                    | vk::PipelineStageFlags2::PRE_RASTERIZATION_SHADERS,
+                    | vk::PipelineStageFlags2::PRE_RASTERIZATION_SHADERS
+                    | vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
                 vk::AccessFlags2::SHADER_READ,
             ),
             vk::ImageLayout::TRANSFER_DST_OPTIMAL => (
@@ -148,7 +164,134 @@ impl Image {
                 vk::AccessFlags2::TRANSFER_WRITE,
             ),
             vk::ImageLayout::GENERAL => (
-                vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::TRANSFER,
+                vk::PipelineStageFlags2::COMPUTE_SHADER
+                    | vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
+                    | vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::MEMORY_READ
+                    | vk::AccessFlags2::MEMORY_WRITE
+                    | vk::AccessFlags2::TRANSFER_WRITE,
+            ),
+            vk::ImageLayout::PRESENT_SRC_KHR => (
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::NONE,
+            ),
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL => (
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_READ,
+            ),
+            _ => {
+                log::error!("Unsupported layout transition!");
+                (
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
+                    vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+                )
+            }
+        }
+    }
+
+    pub fn subresource_range_memory_barrier<'a>(
+        &self,
+        subresource_range: vk::ImageSubresourceRange,
+        old_layout: vk::ImageLayout,
+        new_layout: vk::ImageLayout,
+    ) -> vk::ImageMemoryBarrier2<'a> {
+        let (src_stage, src_access) = Self::get_pipeline_stage_acces_tuple(old_layout);
+        let (dst_stage, dst_access) = Self::get_pipeline_stage_acces_tuple(new_layout);
+        vk::ImageMemoryBarrier2::default()
+            .dst_access_mask(dst_access)
+            .dst_stage_mask(dst_stage)
+            .src_access_mask(src_access)
+            .src_stage_mask(src_stage)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .old_layout(old_layout)
+            .new_layout(new_layout)
+            .image(self.image)
+            .subresource_range(subresource_range)
+    }
+
+    pub fn memory_barrier<'a>(
+        &self,
+        old_layout: vk::ImageLayout,
+        new_layout: vk::ImageLayout,
+    ) -> vk::ImageMemoryBarrier2<'a> {
+        self.subresource_range_memory_barrier(
+            vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_array_layer: 0,
+                base_mip_level: 0,
+                layer_count: 1,
+                level_count: 1,
+            },
+            old_layout,
+            new_layout,
+        )
+    }
+}
+
+impl ImageResource {
+    pub(crate) fn handle(&self) -> ImageHandle {
+        ImageHandle {
+            image: self.image.image,
+            view: self.view,
+            extent: self.extent,
+            format: self.image.format,
+        }
+    }
+}
+
+impl Image {
+    pub fn new_subresource(
+        self,
+        device: &ash::Device,
+        extent: vk::Extent2D,
+        subresource_range: vk::ImageSubresourceRange,
+    ) -> ImageResource {
+        let image_view_info = vk::ImageViewCreateInfo::default()
+            .image(self.image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(self.format)
+            .components(vk::ComponentMapping {
+                r: vk::ComponentSwizzle::IDENTITY,
+                g: vk::ComponentSwizzle::IDENTITY,
+                b: vk::ComponentSwizzle::IDENTITY,
+                a: vk::ComponentSwizzle::IDENTITY,
+            })
+            .subresource_range(subresource_range);
+        let view = unsafe { device.create_image_view(&image_view_info, None) }.unwrap();
+
+        ImageResource {
+            extent,
+            image: self,
+            view,
+        }
+    }
+    pub fn get_pipeline_stage_acces_tuple(
+        state: vk::ImageLayout,
+    ) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
+        match state {
+            vk::ImageLayout::UNDEFINED => {
+                (vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::NONE)
+            }
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => (
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            ),
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
+                vk::PipelineStageFlags2::FRAGMENT_SHADER
+                    | vk::PipelineStageFlags2::COMPUTE_SHADER
+                    | vk::PipelineStageFlags2::PRE_RASTERIZATION_SHADERS
+                    | vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+                vk::AccessFlags2::SHADER_READ,
+            ),
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL => (
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_WRITE,
+            ),
+            vk::ImageLayout::GENERAL => (
+                vk::PipelineStageFlags2::COMPUTE_SHADER
+                    | vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
+                    | vk::PipelineStageFlags2::TRANSFER,
                 vk::AccessFlags2::MEMORY_READ
                     | vk::AccessFlags2::MEMORY_WRITE
                     | vk::AccessFlags2::TRANSFER_WRITE,
@@ -210,31 +353,6 @@ impl Image {
         )
     }
 
-    pub fn new_subresource(
-        self,
-        device: &ash::Device,
-        extent: vk::Extent2D,
-        subresource_range: vk::ImageSubresourceRange,
-    ) -> ImageResource {
-        let image_view_info = vk::ImageViewCreateInfo::default()
-            .image(self.image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(self.format)
-            .components(vk::ComponentMapping {
-                r: vk::ComponentSwizzle::IDENTITY,
-                g: vk::ComponentSwizzle::IDENTITY,
-                b: vk::ComponentSwizzle::IDENTITY,
-                a: vk::ComponentSwizzle::IDENTITY,
-            })
-            .subresource_range(subresource_range);
-        let view = unsafe { device.create_image_view(&image_view_info, None) }.unwrap();
-
-        ImageResource {
-            extent,
-            image: self,
-            view,
-        }
-    }
     pub fn new_resource(self, device: &ash::Device, extent: vk::Extent2D) -> ImageResource {
         self.new_subresource(
             device,
@@ -340,6 +458,19 @@ impl Buffer {
         })
     }
 
+    pub(crate) fn copy_to_image(
+        &self,
+        cmd: &vk::CommandBuffer,
+        dst: &Image,
+        layout: vk::ImageLayout,
+    ) {
+        self.handle().copy_to_image(cmd, dst, layout);
+    }
+
+    pub(crate) fn copy(self, cmd: &vk::CommandBuffer, dst_buffer: &BufferHandle) {
+        self.handle().copy(cmd, dst_buffer);
+    }
+
     pub(crate) fn new(
         usage: vk::BufferUsageFlags,
         memory_location: MemoryLocation,
@@ -373,6 +504,47 @@ impl Buffer {
         Ok(())
     }
 
+    pub(crate) fn from_data_with_size<T: Copy>(
+        usage: vk::BufferUsageFlags,
+        data: &[T],
+        size: u64,
+    ) -> Result<Buffer> {
+        let ctx = Context::get();
+        let staging_buffer = Self::new(
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            MemoryLocation::CpuToGpu,
+            size,
+        )?;
+        staging_buffer.copy_data_to_buffer(data)?;
+
+        let buffer = Self::new(
+            usage | vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryLocation::GpuOnly,
+            size,
+        )?;
+
+        ctx.execute_one_time_commands(|cmd_buffer| {
+            staging_buffer.copy(cmd_buffer, &buffer.handle());
+        })?;
+
+        Ok(buffer)
+    }
+
+    pub(crate) fn from_data<T: Copy>(usage: vk::BufferUsageFlags, data: &[T]) -> Result<Buffer> {
+        let size = size_of_val(data) as _;
+        Self::from_data_with_size(usage, data, size)
+    }
+
+    pub(crate) fn handle(&self) -> BufferHandle {
+        BufferHandle {
+            buffer: self.buffer,
+            address: self.address,
+            size: self.size,
+        }
+    }
+}
+
+impl BufferHandle {
     pub(crate) fn copy_to_image(
         &self,
         cmd: &vk::CommandBuffer,
@@ -403,7 +575,7 @@ impl Buffer {
         };
     }
 
-    pub(crate) fn copy(self, cmd: &vk::CommandBuffer, dst_buffer: &Buffer) {
+    pub(crate) fn copy(self, cmd: &vk::CommandBuffer, dst_buffer: &BufferHandle) {
         let ctx = Context::get();
         unsafe {
             let region = vk::BufferCopy::default().size(self.size);
@@ -414,37 +586,6 @@ impl Buffer {
                 std::slice::from_ref(&region),
             )
         };
-    }
-
-    pub(crate) fn from_data_with_size<T: Copy>(
-        usage: vk::BufferUsageFlags,
-        data: &[T],
-        size: u64,
-    ) -> Result<Buffer> {
-        let ctx = Context::get();
-        let staging_buffer = Self::new(
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            MemoryLocation::CpuToGpu,
-            size,
-        )?;
-        staging_buffer.copy_data_to_buffer(data)?;
-
-        let buffer = Self::new(
-            usage | vk::BufferUsageFlags::TRANSFER_DST,
-            MemoryLocation::GpuOnly,
-            size,
-        )?;
-
-        ctx.execute_one_time_commands(|cmd_buffer| {
-            staging_buffer.copy(cmd_buffer, &buffer);
-        })?;
-
-        Ok(buffer)
-    }
-
-    pub(crate) fn from_data<T: Copy>(usage: vk::BufferUsageFlags, data: &[T]) -> Result<Buffer> {
-        let size = size_of_val(data) as _;
-        Self::from_data_with_size(usage, data, size)
     }
 }
 
@@ -460,6 +601,50 @@ impl ImageResource {
         let image = Image::new_2d(usage, memory_location, format, width, height)?;
         let extend = image.extent.clone();
         Ok(image.new_resource(&ctx.device, extend))
+    }
+
+    pub fn copy(
+        &self,
+        cmd: &vk::CommandBuffer,
+        other: &ImageHandle,
+        src_layout: vk::ImageLayout,
+        dst_layout: vk::ImageLayout,
+    ) {
+        self.handle().copy(cmd, other, src_layout, dst_layout);
+    }
+
+    pub fn blit(
+        &self,
+        cmd: &vk::CommandBuffer,
+        other: &ImageHandle,
+        src_layout: vk::ImageLayout,
+        dst_layout: vk::ImageLayout,
+    ) {
+        self.handle().blit(cmd, other, src_layout, dst_layout);
+    }
+
+    pub fn get_pipeline_stage_acces_tuple(
+        state: vk::ImageLayout,
+    ) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
+        ImageHandle::get_pipeline_stage_acces_tuple(state)
+    }
+
+    pub fn subresource_range_memory_barrier<'a>(
+        &self,
+        subresource_range: vk::ImageSubresourceRange,
+        old_layout: vk::ImageLayout,
+        new_layout: vk::ImageLayout,
+    ) -> vk::ImageMemoryBarrier2<'a> {
+        self.handle()
+            .subresource_range_memory_barrier(subresource_range, old_layout, new_layout)
+    }
+
+    pub fn memory_barrier<'a>(
+        &self,
+        old_layout: vk::ImageLayout,
+        new_layout: vk::ImageLayout,
+    ) -> vk::ImageMemoryBarrier2<'a> {
+        self.handle().memory_barrier(old_layout, new_layout)
     }
 
     pub fn new_from_data(image: DynamicImage, format: vk::Format) -> Result<Self> {

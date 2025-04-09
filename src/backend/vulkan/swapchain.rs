@@ -4,10 +4,11 @@ use ash::{khr, vk, Device, Instance};
 use crate::WINDOW_SIZE;
 
 use super::{
-    render_graph::FRAMES_IN_FLIGHT,
     utils::{Image, ImageResource},
-    vulkan_context::Context,
+    Context,
 };
+
+pub(crate) const FRAMES_IN_FLIGHT: usize = 3;
 
 pub struct FrameResources {
     pub image_availible_semaphore: vk::Semaphore,
@@ -161,5 +162,35 @@ impl Swapchain {
             images,
             frame_resources,
         })
+    }
+
+    pub fn next_image(&self, frame_in_flight: usize) -> usize {
+        unsafe {
+            self.ash_swapchain
+                .acquire_next_image(
+                    self.vk_swapchain,
+                    1000000000,
+                    self.frame_resources[frame_in_flight].image_availible_semaphore,
+                    vk::Fence::null(),
+                )
+                .unwrap()
+        }
+        .0 as usize
+    }
+
+    pub fn present(&self, frame_in_flight: usize, swapchain_image: usize) {
+        let ctx = Context::get();
+        let binding = [self.frame_resources[frame_in_flight as usize].render_finished_semaphore];
+        let swapchains = [self.vk_swapchain];
+        let image_indices = [swapchain_image as u32];
+        let present_info = vk::PresentInfoKHR::default()
+            .image_indices(&image_indices)
+            .swapchains(&swapchains)
+            .wait_semaphores(&binding);
+        unsafe {
+            self.ash_swapchain
+                .queue_present(ctx.graphics_queue, &present_info)
+                .unwrap()
+        };
     }
 }

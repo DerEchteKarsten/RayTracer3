@@ -3,7 +3,11 @@ use std::{collections::HashMap, ffi::CStr, mem::MaybeUninit, sync::Once};
 use anyhow::Result;
 use ash::vk;
 
-use super::{bindless::BindlessDescriptorHeap, raytracing::{RayTracingContext, RayTracingShaderCreateInfo, ShaderBindingTable}, vulkan_context::Context};
+use super::{
+    bindless::BindlessDescriptorHeap,
+    vulkan::raytracing::{RayTracingContext, RayTracingShaderCreateInfo, ShaderBindingTable},
+    vulkan::Context,
+};
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 pub struct ComputePipelineHandle {
@@ -35,11 +39,8 @@ impl RayTracingPipelineHandle {
         unsafe {
             let raytracing = RayTracingContext::get();
             let ctx = Context::get();
-            ctx.device.cmd_bind_pipeline(
-                *cmd,
-                vk::PipelineBindPoint::RAY_TRACING_KHR,
-                *pipeline,
-            );
+            ctx.device
+                .cmd_bind_pipeline(*cmd, vk::PipelineBindPoint::RAY_TRACING_KHR, *pipeline);
             let call_region = vk::StridedDeviceAddressRegionKHR::default();
             raytracing.pipeline_fn.cmd_trace_rays(
                 *cmd,
@@ -125,10 +126,7 @@ impl PipelineCache {
             Some(pipeline) => pipeline,
             None => {
                 let entry = format!("{}\0", handle.entry);
-                let path = format!(
-                    "./../../../shader/bin/{}.slang.spv",
-                    handle.path,
-                );
+                let path = format!("./../../../shader/bin/{}.slang.spv", handle.path,);
 
                 let ctx = Context::get();
                 let create_info = vk::ComputePipelineCreateInfo::default()
@@ -144,56 +142,55 @@ impl PipelineCache {
                         .unwrap()
                 }[0];
 
-                Self::get_mut().compute_pipelines.insert(handle.clone(), pipeline);
+                Self::get_mut()
+                    .compute_pipelines
+                    .insert(handle.clone(), pipeline);
                 Self::get().compute_pipelines.get(handle).unwrap()
             }
         }
     }
 
-    pub fn get_raytracing_pipeline(handle: &RayTracingPipelineHandle) -> &(vk::Pipeline, ShaderBindingTable) {
+    pub fn get_raytracing_pipeline(
+        handle: &RayTracingPipelineHandle,
+    ) -> &(vk::Pipeline, ShaderBindingTable) {
         let s = Self::get_mut();
         match s.raytracing_pipelines.get(handle) {
             Some(pipeline) => pipeline,
             None => {
                 let entry = format!("{}\0", handle.entry);
-                let path = format!(
-                    "./../../../shader/bin/{}.slang.spv",
-                    handle.path,
-                );
+                let path = format!("./../../../shader/bin/{}.slang.spv", handle.path,);
 
                 let raytracing_ctx = RayTracingContext::get();
                 let (pipeline, shader_binding_table) = raytracing_ctx
-                .create_raytracing_pipeline(
-                    BindlessDescriptorHeap::get().layout,
-                    &[
-                        RayTracingShaderCreateInfo {
-                            group: crate::raytracing::RayTracingShaderGroup::RayGen,
-                            source: &[(
-                                &path,
-                                &entry,
-                                vk::ShaderStageFlags::RAYGEN_KHR,
-                            )],
-                        },
-                        RayTracingShaderCreateInfo {
-                            group: crate::raytracing::RayTracingShaderGroup::Hit,
-                            source: &[(
-                                "shaders/bin/default_hit",
-                                "main\0",
-                                vk::ShaderStageFlags::CLOSEST_HIT_KHR,
-                            )],
-                        },
-                        RayTracingShaderCreateInfo {
-                            group: crate::raytracing::RayTracingShaderGroup::Miss,
-                            source: &[(
-                                "shaders/bin/default_miss",
-                                "main\0",
-                                vk::ShaderStageFlags::MISS_KHR,
-                            )],
-                        },
-                    ],
-                )
-                .unwrap();
-                Self::get_mut().raytracing_pipelines.insert(handle.clone(), (pipeline, shader_binding_table));
+                    .create_raytracing_pipeline(
+                        BindlessDescriptorHeap::get().layout,
+                        &[
+                            RayTracingShaderCreateInfo {
+                                group: crate::raytracing::RayTracingShaderGroup::RayGen,
+                                source: &[(&path, &entry, vk::ShaderStageFlags::RAYGEN_KHR)],
+                            },
+                            RayTracingShaderCreateInfo {
+                                group: crate::raytracing::RayTracingShaderGroup::Hit,
+                                source: &[(
+                                    "shaders/bin/default_hit",
+                                    "main\0",
+                                    vk::ShaderStageFlags::CLOSEST_HIT_KHR,
+                                )],
+                            },
+                            RayTracingShaderCreateInfo {
+                                group: crate::raytracing::RayTracingShaderGroup::Miss,
+                                source: &[(
+                                    "shaders/bin/default_miss",
+                                    "main\0",
+                                    vk::ShaderStageFlags::MISS_KHR,
+                                )],
+                            },
+                        ],
+                    )
+                    .unwrap();
+                Self::get_mut()
+                    .raytracing_pipelines
+                    .insert(handle.clone(), (pipeline, shader_binding_table));
                 Self::get().raytracing_pipelines.get(handle).unwrap()
             }
         }

@@ -3,10 +3,12 @@ use std::mem::MaybeUninit;
 use anyhow::{Ok, Result};
 use ash::vk;
 
+use crate::raytracing::AccelerationStructure;
+
 use super::{
-    raytracing::RayTracingContext,
-    utils::{Buffer, Image, ImageResource},
-    vulkan_context::Context,
+    vulkan::raytracing::RayTracingContext,
+    vulkan::utils::{Buffer, BufferHandle, Image, ImageHandle, ImageResource},
+    vulkan::Context,
 };
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash)]
@@ -26,12 +28,11 @@ impl DescriptorResourceHandle {
 enum AccessType {
     ReadOnly,
     ReadWrite,
-    WriteOnly,
 }
 
 #[derive(Clone, Copy)]
 #[repr(u32)]
-enum RenderResourceTag {
+pub enum RenderResourceTag {
     Buffer,
     Image,
     Texture,
@@ -168,7 +169,7 @@ impl BindlessDescriptorHeap {
         )
     }
 
-    pub fn allocate_buffer_handle(&mut self, buffer: &Buffer) -> DescriptorResourceHandle {
+    pub fn allocate_buffer_handle(&mut self, buffer: &BufferHandle) -> DescriptorResourceHandle {
         let ctx = Context::get();
         let handle = Self::fetch_available_descriptor(
             self,
@@ -200,7 +201,7 @@ impl BindlessDescriptorHeap {
 
     pub fn allocate_storage_image_handle(
         &mut self,
-        image: &ImageResource,
+        image: &ImageHandle,
     ) -> DescriptorResourceHandle {
         let ctx = Context::get();
         let handle =
@@ -228,7 +229,7 @@ impl BindlessDescriptorHeap {
         handle
     }
 
-    pub fn allocate_texture_handle(&mut self, image: &ImageResource) -> DescriptorResourceHandle {
+    pub fn allocate_texture_handle(&mut self, image: &ImageHandle) -> DescriptorResourceHandle {
         let ctx = Context::get();
         let handle =
             Self::fetch_available_descriptor(self, RenderResourceTag::Image, AccessType::ReadWrite);
@@ -240,7 +241,7 @@ impl BindlessDescriptorHeap {
         };
 
         let write = [vk::WriteDescriptorSet {
-            dst_set: self.sets[BindlessTableType::Images.set_index()],
+            dst_set: self.sets[BindlessTableType::Textures.set_index()],
             dst_binding: 0,
             descriptor_count: 1,
             dst_array_element: handle.index(),
@@ -250,6 +251,29 @@ impl BindlessDescriptorHeap {
         }];
         unsafe {
             ctx.device.update_descriptor_sets(&write, &[]);
+        };
+
+        handle
+    }
+
+
+    pub fn allocate_acceleration_structure_handle(&mut self, tlas: AccelerationStructure) -> DescriptorResourceHandle {
+        let ctx = Context::get();
+        let handle =
+            Self::fetch_available_descriptor(self, RenderResourceTag::AccelerationStructure, AccessType::ReadWrite);
+
+        let mut write_set_as = vk::WriteDescriptorSetAccelerationStructureKHR::default()
+            .acceleration_structures(std::slice::from_ref(&tlas.accel));
+
+        let mut write = vk::WriteDescriptorSet::default()
+            .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+            .dst_binding(0)
+            .dst_array_element(handle.index())
+            .dst_set(self.sets[BindlessTableType::AccelerationStructures.set_index()])
+            .push_next(&mut write_set_as);
+        write.descriptor_count = 1;
+        unsafe {
+            ctx.device.update_descriptor_sets(&[write], &[]);
         };
 
         handle

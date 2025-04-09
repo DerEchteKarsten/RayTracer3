@@ -7,12 +7,19 @@ pub mod scene;
 use std::time::{Duration, Instant};
 
 use ::imgui::Condition;
-use ash::vk;
+use ash::vk::{self, Format};
 use assets::{gltf, model::Model};
 use backend::{
-    raytracing::{self, RayTracingContext},
-    utils::{create_sampler, Buffer, Image, ImageResource, SamplerInfo},
-    vulkan_context::{self, Context},
+    bindless::BindlessDescriptorHeap,
+    pipeline_cache::PipelineCache,
+    render_graph::{
+        build::{ComputePass, DispatchSize, ImageSize, LaunchSize, RayTracingPass},
+        RenderGraph, ResourceDescription,
+    },
+    vulkan::raytracing::{self, RayTracingContext},
+    vulkan::swapchain::Swapchain,
+    vulkan::utils::{create_sampler, Buffer, Image, ImageResource, SamplerInfo},
+    vulkan::{self, Context},
 };
 use glam::{vec3, IVec2, Mat4};
 use gpu_allocator::MemoryLocation;
@@ -91,6 +98,8 @@ fn main() {
 
     let model = model_thread.join().unwrap();
     let model = Model::from_gltf(model).unwrap();
+    BindlessDescriptorHeap::init(&model.samplers);
+    PipelineCache::init();
 
     let image = image_thread.join().unwrap();
     let skybox = ImageResource::new_from_data(image, vk::Format::R32G32B32A32_SFLOAT).unwrap();
@@ -153,166 +162,41 @@ fn main() {
     )
     .unwrap();
 
-    let scene_resources = SceneResources {
-        geometry_infos: model.geometry_info_buffer,
-        index_buffer: model.index_buffer,
-        samplers: model.samplers,
-        skybox: Some(skybox),
-        skybox_sampler: Some(create_sampler(&sampler_info).unwrap()),
-        texture_images: model.images,
-        texture_samplers: model.textures,
-        tlas,
-        uniform_buffer,
-        vertex_buffer: model.vertex_buffer,
-    };
-
     let mut imgui = ImGui::new(&window);
 
-    let mut render_graph = RenderGraph::new(scene_resources, &mut imgui);
-    let swapchain_format = render_graph.swpachain_format();
+    let mut rg = RenderGraph::new();
+    let swapchain_format = rg.get_swapchain_format();
 
-    render_graph
-        .add_image_resource(
-            "GBuffer",
-            vk::Format::R32G32B32A32_UINT,
-            ImageSize::Viewport,
-        )
-        .add_image_resource("GBufferDepth", vk::Format::R32_SFLOAT, ImageSize::Viewport)
-        .add_image_resource("Out", swapchain_format, ImageSize::Viewport)
-        .add_temporal_image_resource(
-            "ProbeAtlas",
-            vk::Format::R32G32B32A32_SFLOAT,
-            ImageSize::ViewportFraction { x: 0.5, y: 0.5 },
-        )
-        .add_buffer_resource(
-            "SphericalHarmonics",
-            (WINDOW_SIZE.y as u64 * WINDOW_SIZE.x as u64 * (9 * 4 * 3)).div_ceil(16),
-        )
-        .add_temporal_image_resource(
-            "Light",
-            vk::Format::R32G32B32A32_SFLOAT,
-            ImageSize::Viewport,
-        )
-        .add_image_resource(
-            "TraceDirections",
-            vk::Format::R16_UINT,
-            ImageSize::ViewportFraction { x: 0.5, y: 0.5 },
-        )
-        .add_image_resource(
-            "DebugPDFs",
-            vk::Format::R32_SFLOAT,
-            ImageSize::ViewportFraction { x: 0.5, y: 0.5 },
-        );
+    let vertecies = rg.import(BindlessDescriptorHeap::get_mut().allocate_buffer_handle(&model.vertex_buffer.handle()));
+    let tlas = rg.import(BindlessDescriptorHeap::get_mut().allocate_acceleration_structure_handle(tlas));
 
-    let frame = FrameBuilder::default()
-        .add_pass(
-            PassBuilder::new_raytracing(
-                "GBuffer",
-                RayTracingPassBuilder::default()
-                    .raygen_shader("gbuffer.slang.spv")
-                    .launch_fullscreen(),
-            )
-            .bindles_descriptor(true)
-            .write("GBuffer")
-            .write("GBufferDepth"),
-        )
-        .add_pass(
-            PassBuilder::new_compute(
-                "StructuredImportanceSampling",
-                ComputePassBuilder::default()
-                    .shader("structured_importance_sampling.slang.spv")
-                    .dispatch(
-                        (WINDOW_SIZE.x as u32).div_ceil(16),
-                        (WINDOW_SIZE.y as u32).div_ceil(16),
-                        1,
-                    ),
-            )
-            .bindles_descriptor(true)
-            .read_previous("ProbeAtlas")
-            .read("GBuffer")
-            .read("GBufferDepth")
-            .write("TraceDirections")
-            .write("DebugPDFs"),
-        )
-        .add_pass(
-            PassBuilder::new_raytracing(
-                "TraceProbes",
-                RayTracingPassBuilder::default()
-                    .raygen_shader("trace_probes.slang.spv")
-                    .launch(WINDOW_SIZE.x as u32 / 2, WINDOW_SIZE.y as u32 / 2),
-            )
-            .bindles_descriptor(true)
-            .write("ProbeAtlas")
-            .read_previous("ProbeAtlas")
-            .read("GBuffer")
-            .read("GBufferDepth")
-            .read("TraceDirections"),
-        )
-        .add_pass(
-            PassBuilder::new_compute(
-                "SphericalHarmonics",
-                ComputePassBuilder::default()
-                    .shader("spherical_harmonic_conversion.slang.spv")
-                    .dispatch(
-                        (WINDOW_SIZE.x as u32).div_ceil(16),
-                        (WINDOW_SIZE.y as u32).div_ceil(16),
-                        1,
-                    ),
-            )
-            .write("SphericalHarmonics")
-            .read("ProbeAtlas"),
-        )
-        .add_pass(
-            PassBuilder::new_compute(
-                "InterpolateProbes",
-                ComputePassBuilder::default()
-                    .shader("interpolate_probes.slang.spv")
-                    .dispatch(WINDOW_SIZE.x as u32 / 8, WINDOW_SIZE.y as u32 / 8, 1),
-            )
-            .bindles_descriptor(true)
-            .read("GBuffer")
-            .read("GBufferDepth")
-            .read("SphericalHarmonics")
-            .write("Light"),
-        )
-        .add_pass(
-            PassBuilder::new_raytracing(
-                "RefrenceMode",
-                RayTracingPassBuilder::default()
-                    .raygen_shader("refrence_mode.slang.spv")
-                    .launch_fullscreen(),
-            )
-            .bindles_descriptor(true)
-            .read("GBuffer")
-            .read("GBufferDepth")
-            .read_previous("Light")
-            .write("Light")
-            .toggle_active(false),
-        )
-        .add_pass(
-            PassBuilder::new_compute(
-                "Postprocess",
-                ComputePassBuilder::default()
-                    .shader("postprocess.slang.spv")
-                    .dispatch(WINDOW_SIZE.x as u32 / 8, WINDOW_SIZE.y as u32 / 8, 1),
-            )
-            .bindles_descriptor(true)
-            .read("GBufferDepth")
-            .read("Light")
-            .write("Out"),
-        )
-        // .add_pass(PassBuilder::new_raster("Gizzmos", RasterizationPassBuilder::default()
-        //     .attachment("Out")
-        //     .depth_attachment("GBufferDepth")
-        //     .mesh_shader("gizzmos.slang.spv")
-        //     .mesh_entry("mesh")
-        //     .fragment_entry("fragment")
-        //     .fragment_shader("gizzmos.slang.spv")
-        //     .dispatch(1, 1, 1))
-        // )
-        .set_back_buffer_source("Out");
+    let gbuffer = RayTracingPass::new(&mut rg)
+        .shader("gbuffer")
+        .read(&vertecies)
+        .read(&tlas)
+        .write_image("gbuffer", ImageSize::FullScreen, Format::R32G32B32A32_UINT)
+        .write_image("gbuffer_depth", ImageSize::FullScreen, Format::R32_SFLOAT)
+        .launch(LaunchSize::FullScreen);
 
-    render_graph.compile(frame);
+    let brdf_rays = RayTracingPass::new(&mut rg)
+        .shader("refrence_mode")
+        .read_node(gbuffer, 0)
+        .write_image("", ImageSize::FullScreen, Format::R32G32B32A32_SFLOAT)
+        .launch(LaunchSize::FullScreen);
+
+    let test = RayTracingPass::new(&mut rg)
+        .shader("test")
+        .read_write(gbuffer, 0)
+        .write_image(ImageSize::FullScreen, Format::R32G32B32A32_SFLOAT)
+        .launch(LaunchSize::FullScreen);
+
+    let tonemap = ComputePass::new(&mut rg)
+        .shader("postprocess")
+        .read_node(brdf_rays, 0)
+        .write_image(ImageSize::FullScreen, swapchain_format)
+        .dispatch(DispatchSize::FullScreen);
+
+    rg.set_output(tonemap, 0);
 
     let mut controles = Controls {
         ..Default::default()
@@ -375,12 +259,11 @@ fn main() {
                         let new_cam = camera.update(&controles, frame_time);
                         camera = new_cam;
                         gconst.planar_view_constants = camera.planar_view_constants();
-                        gconst.frame = render_graph.frame_number.try_into().unwrap_or(0);
+                        gconst.frame = rg.frame_number.try_into().unwrap_or(0);
                         gconst.mouse = [
                             controles.cursor_position[0] as u32,
                             controles.cursor_position[1] as u32,
                         ];
-                        render_graph.update_uniform(&gconst);
 
                         let ui = imgui.context.frame();
                         ui.window("Constants Editor")
@@ -401,34 +284,10 @@ fn main() {
                                     .build();
                                 ui.checkbox_flags("ProbeRng", &mut gconst.proberng, 0x1);
 
-                                if let Some(token) =
-                                    ui.begin_combo("Backbuffer", render_graph.back_buffer.as_str())
-                                {
-                                    for (i, res) in &render_graph.resources {
-                                        if res.ty == ResourceType::Image
-                                            && ui.selectable(i.as_str())
-                                        {
-                                            render_graph.back_buffer = i.clone();
-                                        }
-                                    }
-                                    token.end();
-                                }
-
-                                if ui.checkbox("Refrence Mode", &mut refrence_mode) {
-                                    render_graph.toggle_pass("RefrenceMode", refrence_mode);
-                                    render_graph.toggle_pass("InterpolateProbes", !refrence_mode);
-                                    render_graph.toggle_pass("SphericalHarmonics", !refrence_mode);
-                                    render_graph.toggle_pass("TraceProbes", !refrence_mode);
-                                    render_graph.toggle_pass(
-                                        "StructuredImportanceSampling",
-                                        !refrence_mode,
-                                    );
-                                }
+                                if ui.checkbox("Refrence Mode", &mut refrence_mode) {}
                             });
                         imgui.platform.prepare_render(ui, &window);
                         let draw_data = imgui.context.render();
-
-                        render_graph.draw(draw_data);
                     }
                     _ => (),
                 },

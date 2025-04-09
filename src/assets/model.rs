@@ -2,9 +2,9 @@ use std::mem::{size_of, size_of_val};
 
 use super::gltf::{self, Vertex};
 use crate::backend::{
-    raytracing::{AccelerationStructure, RayTracingContext},
-    utils::{Buffer, Image, ImageResource},
-    vulkan_context::Context,
+    vulkan::raytracing::{AccelerationStructure, RayTracingContext},
+    vulkan::utils::{Buffer, Image, ImageResource},
+    vulkan::Context,
 };
 use anyhow::Result;
 use ash::vk::{self, Packed24_8};
