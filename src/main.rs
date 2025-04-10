@@ -1,5 +1,6 @@
 #![feature(let_chains)]
 #![feature(generic_const_exprs)]
+#![feature(int_roundings)]
 pub mod assets;
 pub mod backend;
 pub mod imgui;
@@ -7,19 +8,22 @@ pub mod scene;
 use std::time::{Duration, Instant};
 
 use ::imgui::Condition;
-use ash::vk::{self, Format};
+use ash::vk::{self, BufferUsageFlags, Format, ImageUsageFlags};
 use assets::{gltf, model::Model};
 use backend::{
     bindless::BindlessDescriptorHeap,
     pipeline_cache::PipelineCache,
     render_graph::{
         build::{ComputePass, DispatchSize, ImageSize, LaunchSize, RayTracingPass},
-        RenderGraph, ResourceDescription,
+        RenderGraph, IMPORTED, SWPACHAIN,
     },
-    vulkan::raytracing::{self, RayTracingContext},
-    vulkan::swapchain::Swapchain,
-    vulkan::utils::{create_sampler, Buffer, Image, ImageResource, SamplerInfo},
-    vulkan::{self, Context},
+    vulkan::{
+        self,
+        raytracing::{self, RayTracingContext},
+        swapchain::Swapchain,
+        utils::{create_sampler, Buffer, Image, ImageResource, SamplerInfo},
+        Context,
+    },
 };
 use glam::{vec3, IVec2, Mat4};
 use gpu_allocator::MemoryLocation;
@@ -98,7 +102,7 @@ fn main() {
 
     let model = model_thread.join().unwrap();
     let model = Model::from_gltf(model).unwrap();
-    BindlessDescriptorHeap::init(&model.samplers);
+    BindlessDescriptorHeap::init();
     PipelineCache::init();
 
     let image = image_thread.join().unwrap();
@@ -154,50 +158,55 @@ fn main() {
             .unwrap()
     };
 
-    let uniform_buffer = Buffer::new_aligned(
-        vk::BufferUsageFlags::UNIFORM_BUFFER,
-        MemoryLocation::CpuToGpu,
-        size_of::<GConst>() as u64,
-        Some(16),
-    )
-    .unwrap();
-
     let mut imgui = ImGui::new(&window);
-
     let mut rg = RenderGraph::new();
-    let swapchain_format = rg.get_swapchain_format();
 
-    let vertecies = rg.import(BindlessDescriptorHeap::get_mut().allocate_buffer_handle(&model.vertex_buffer.handle()));
-    let tlas = rg.import(BindlessDescriptorHeap::get_mut().allocate_acceleration_structure_handle(tlas));
+    // let vertecies = rg.import_buffer(&model.vertex_buffer.handle());
+    // let tlas = rg.import_tlas(&tlas);
 
-    let gbuffer = RayTracingPass::new(&mut rg)
-        .shader("gbuffer")
-        .read(&vertecies)
-        .read(&tlas)
-        .write_image("gbuffer", ImageSize::FullScreen, Format::R32G32B32A32_UINT)
-        .write_image("gbuffer_depth", ImageSize::FullScreen, Format::R32_SFLOAT)
-        .launch(LaunchSize::FullScreen);
+    // let gbuffer = rg.image(
+    //     ImageSize::FullScreen,
+    //     vk::ImageUsageFlags::STORAGE,
+    //     vk::Format::R32G32B32A32_UINT,
+    // );
+    // let gbuffer_depth = rg.image(
+    //     ImageSize::FullScreen,
+    //     vk::ImageUsageFlags::STORAGE,
+    //     vk::Format::R32_SFLOAT,
+    // );
+    // let diffuse_lighting = rg.image(
+    //     ImageSize::FullScreen,
+    //     vk::ImageUsageFlags::STORAGE,
+    //     vk::Format::R32G32B32A32_SFLOAT,
+    // );
+    // let output = rg.image(
+    //     ImageSize::FullScreen,
+    //     vk::ImageUsageFlags::STORAGE,
+    //     swapchain_format,
+    // );
 
-    let brdf_rays = RayTracingPass::new(&mut rg)
-        .shader("refrence_mode")
-        .read_node(gbuffer, 0)
-        .write_image("", ImageSize::FullScreen, Format::R32G32B32A32_SFLOAT)
-        .launch(LaunchSize::FullScreen);
+    // let gbuffer_pass = RayTracingPass::new(&mut rg)
+    //     .shader("gbuffer")
+    //     .read(IMPORTED, vertecies)
+    //     .read(IMPORTED, tlas)
+    //     .write(gbuffer)
+    //     .write(gbuffer_depth)
+    //     .launch(LaunchSize::FullScreen);
 
-    let test = RayTracingPass::new(&mut rg)
-        .shader("test")
-        .read_write(gbuffer, 0)
-        .write_image(ImageSize::FullScreen, Format::R32G32B32A32_SFLOAT)
-        .launch(LaunchSize::FullScreen);
+    // let brdf_rays = RayTracingPass::new(&mut rg)
+    //     .shader("refrence_mode")
+    //     .read(gbuffer_pass, gbuffer)
+    //     .read(gbuffer_pass, gbuffer_depth)
+    //     .write(diffuse_lighting)
+    //     .launch(LaunchSize::FullScreen);
 
-    let tonemap = ComputePass::new(&mut rg)
-        .shader("postprocess")
-        .read_node(brdf_rays, 0)
-        .write_image(ImageSize::FullScreen, swapchain_format)
-        .dispatch(DispatchSize::FullScreen);
+    // let tonemap = ComputePass::new(&mut rg)
+    //     .shader("postprocess")
+    //     .read(brdf_rays, diffuse_lighting)
+    //     .write(output)
+    //     .dispatch(DispatchSize::FullScreen);
 
-    rg.set_output(tonemap, 0);
-
+    // let test_texture = rg.image(ImageSize::FullScreen, ImageUsageFlags::STORAGE, Format::R32G32B32A32_SFLOAT);
     let mut controles = Controls {
         ..Default::default()
     };
@@ -222,14 +231,30 @@ fn main() {
                 1.0 / WINDOW_SIZE.y as f32,
                 WINDOW_SIZE.y as f32 / (WINDOW_SIZE.x as f32 * WINDOW_SIZE.x as f32),
             ),
-    );
+        );
+
+    let tlas = rg.import_tlas(&tlas);
+    let vertecies = rg.import_buffer(&model.vertex_buffer.handle());
+    let indicies = rg.import_buffer(&model.index_buffer.handle());
+
+    let gbuffer = RayTracingPass::new(&mut rg)
+        .shader("gbuffer")
+        .constants(&gconst)
+        .read(IMPORTED, tlas)
+        .read(IMPORTED, vertecies)
+        .read(IMPORTED, indicies)
+        .write(SWPACHAIN)
+        .launch(LaunchSize::FullScreen);
+
+    rg.bake().unwrap();
+
     let mut frame_time = Duration::default();
     let mut last_time = Instant::now();
     let mut refrence_mode = false;
 
     #[allow(clippy::collapsible_match, clippy::single_match, deprecated)]
     event_loop
-        .run(move |event, control_flow| {
+        .run(|event, control_flow| {
             control_flow.set_control_flow(ControlFlow::Poll);
             controles = controles.handle_event(&event, &window);
             imgui.handel_events(&window, &event);
@@ -264,30 +289,30 @@ fn main() {
                             controles.cursor_position[0] as u32,
                             controles.cursor_position[1] as u32,
                         ];
+                        rg.draw();
+                        // let ui = imgui.context.frame();
+                        // ui.window("Constants Editor")
+                        //     .size([300.0, WINDOW_SIZE.y as f32], Condition::FirstUseEver)
+                        //     .position([0.0, 0.0], Condition::FirstUseEver)
+                        //     .build(|| {
+                        //         ui.text(format!(
+                        //             "FPS: {:.0}, {:?}",
+                        //             1000.0 / frame_time.as_millis() as f64,
+                        //             frame_time
+                        //         ));
+                        //         ui.slider("Blendfactor", 0.0, 1.0, &mut gconst.blendfactor);
+                        //         ui.input_scalar("Samples", &mut gconst.samples)
+                        //             .step(1)
+                        //             .build();
+                        //         ui.input_scalar("Bounces", &mut gconst.bounces)
+                        //             .step(1)
+                        //             .build();
+                        //         ui.checkbox_flags("ProbeRng", &mut gconst.proberng, 0x1);
 
-                        let ui = imgui.context.frame();
-                        ui.window("Constants Editor")
-                            .size([300.0, WINDOW_SIZE.y as f32], Condition::FirstUseEver)
-                            .position([0.0, 0.0], Condition::FirstUseEver)
-                            .build(|| {
-                                ui.text(format!(
-                                    "FPS: {:.0}, {:?}",
-                                    1000.0 / frame_time.as_millis() as f64,
-                                    frame_time
-                                ));
-                                ui.slider("Blendfactor", 0.0, 1.0, &mut gconst.blendfactor);
-                                ui.input_scalar("Samples", &mut gconst.samples)
-                                    .step(1)
-                                    .build();
-                                ui.input_scalar("Bounces", &mut gconst.bounces)
-                                    .step(1)
-                                    .build();
-                                ui.checkbox_flags("ProbeRng", &mut gconst.proberng, 0x1);
-
-                                if ui.checkbox("Refrence Mode", &mut refrence_mode) {}
-                            });
-                        imgui.platform.prepare_render(ui, &window);
-                        let draw_data = imgui.context.render();
+                        //         if ui.checkbox("Refrence Mode", &mut refrence_mode) {}
+                        //     });
+                        // imgui.platform.prepare_render(ui, &window);
+                        // let draw_data = imgui.context.render();
                     }
                     _ => (),
                 },

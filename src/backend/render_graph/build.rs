@@ -22,8 +22,11 @@ use crate::WINDOW_SIZE;
 use derivative::Derivative;
 
 use super::{
-    Execution, Node, NodeEdge, NodeHandle, RenderGraph, ResourceDescription, ResourceMemoryHandle, ResourceMemoryType, FRAMES_IN_FLIGHT, IMPORTED
+    Execution, Node, NodeEdge, NodeHandle, RenderGraph, ResourceHandle, ResourceMemoryType,
+    FRAMES_IN_FLIGHT, IMPORTED,
 };
+
+use std::ffi;
 
 pub struct NodeBuilder<'a, T>
 where
@@ -34,6 +37,8 @@ where
     reads: Vec<NodeEdge>,
     writes: Vec<NodeEdge>,
     handle: NodeHandle,
+    constants: Option<*const ffi::c_void>,
+    constants_size: usize,
 }
 
 impl<'b, T> NodeBuilder<'b, T>
@@ -48,125 +53,100 @@ where
             execution: MaybeUninit::uninit(),
             reads: Vec::new(),
             writes: Vec::new(),
+            constants: None,
+            constants_size: 0,
         }
     }
 
-    pub(crate) fn read(mut self, node: NodeHandle, name: &str) -> Self {
-        let handle = self.rg.graph[node].writes.iter().find(|e| e.name == name).unwrap().clone();
-        self.reads.push(handle);
+    pub fn constants<C>(mut self, constants: &'b C) -> Self {
+        self.constants = Some(constants as *const C as *const ffi::c_void);
+        self.constants_size = size_of::<C>();
         self
     }
 
-    pub(crate) fn read_index(mut self, node: NodeHandle, index: usize) -> Self {
-        let handle = self.rg.graph[node].writes[index].clone();
-        self.reads.push(handle);
-        self
-    }
-
-    pub(crate) fn read_external(mut self, memory: &ResourceMemoryHandle) -> Self {
-        let handle = NodeEdge {
-            output_of: IMPORTED,
-            output_index: 0,
-            description: ResourceDescription::PercistentBuffer {
-                memory: memory.clone(),
-            },
-            name: "".to_string(),
-        };
-        self.reads.push(handle);
-        self
-    }
-
-    pub(crate) fn read_external_image(
-        mut self,
-        memory: &ResourceMemoryHandle,
-        layout: vk::ImageLayout,
-    ) -> Self {
-        let handle = NodeEdge {
-            output_of: IMPORTED,
-            output_index: 0,
-            description: ResourceDescription::PercistentImage {
-                layout,
-                memory: memory.clone(),
-            },
-            name: "".to_string(),
-        };
-        self.reads.push(handle);
-        self
-    }
-
-    fn write(mut self, description: ResourceDescription, name: &str) -> Self {
-        let output_index = self.writes.len();
-        self.writes.push(NodeEdge {
-            output_of: self.handle,
-            output_index,
-            description: description,
-            name: name.to_string(),
+    pub fn read_array(mut self, output: NodeHandle, handle: ResourceHandle) -> Self {
+        self.reads.push(NodeEdge {
+            layout: Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+            output_of: output,
+            output_index: self.rg.graph[output]
+                .writes
+                .iter()
+                .position(|e| e.resource == handle)
+                .unwrap(),
+            resource: handle,
         });
         self
     }
 
-    pub(crate) fn write_image(self, name: &str, size: ImageSize, format: vk::Format) -> Self {
-        let mut description = ResourceDescription::Image {
-            format,
-            size: size.size(),
-            usage: vk::ImageUsageFlags::STORAGE,
-            layout: vk::ImageLayout::GENERAL,
-            index: 0,
+    pub fn read(mut self, output: NodeHandle, handle: ResourceHandle) -> Self {
+        self.reads.push(NodeEdge {
+            layout: Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+            output_of: output,
+            output_index: self.rg.graph[output]
+                .writes
+                .iter()
+                .position(|e| e.resource == handle)
+                .unwrap(),
+            resource: handle,
+        });
+        self
+    }
+
+    pub fn write(mut self, handle: ResourceHandle) -> Self {
+        let output_index = self.writes.len();
+        self.writes.push(NodeEdge {
+            layout: Some(vk::ImageLayout::GENERAL),
+            output_of: self.handle,
+            output_index,
+            resource: handle,
+        });
+        self
+    }
+
+    pub fn read_write(mut self, output: NodeHandle, handle: ResourceHandle) -> Self {
+        let output_index = self.writes.len();
+        self.reads.push(NodeEdge {
+            layout: Some(vk::ImageLayout::GENERAL),
+            output_of: output,
+            output_index: self.rg.graph[output]
+                .writes
+                .iter()
+                .position(|e| e.resource == handle)
+                .unwrap(),
+            resource: handle,
+        });
+        self.writes.push(NodeEdge {
+            layout: Some(vk::ImageLayout::GENERAL),
+            output_of: self.handle,
+            output_index,
+            resource: handle,
+        });
+        self
+    }
+    fn build(self) -> NodeHandle {
+        let constants_buffer = if let Some(constants) = self.constants {
+            let handle = self.rg.internal_buffer(self.constants_size as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu);
+            let buffer = &self.rg.internal_buffers[handle.index()];
+            unsafe { buffer.allocation.mapped_ptr().unwrap().as_ptr().copy_from(constants, self.constants_size) };
+
+            Some(handle)
+        }else {
+            None
         };
-        let i = self
-            .writes
-            .iter()
-            .chain(self.writes.iter())
-            .fold(0, |acc, e| {
-                if description.eql(&e.description) {
-                    acc + 1
-                } else {
-                    acc
-                }
-            });
-        if let ResourceDescription::Image { index, .. } = &mut description {
-            *index = i;
-        }
-        self.write(description, name)
-    }
-    pub(crate) fn write_buffer(self, name: &str, size: u64) -> Self {
-        let mut description = ResourceDescription::Buffer {
-            size,
-            usage: vk::BufferUsageFlags::STORAGE_BUFFER,
-            index: 0,
+        
+        let mut node = Node {
+            reads: self.reads,
+            writes: self.writes,
+            descriptor_buffer: ResourceHandle(0),
+            constants_buffer,
+            execution: Box::new(unsafe { self.execution.assume_init() }),
+            constants: self.constants,
+            constants_size: self.constants_size
         };
-        let i = self
-            .writes
-            .iter()
-            .chain(self.reads.iter())
-            .fold(0, |acc, e| {
-                if description.eql(&e.description) {
-                    acc + 1
-                } else {
-                    acc
-                }
-            });
-        if let ResourceDescription::Buffer { index, .. } = &mut description {
-            *index = i;
-        }
-        self.write(description, name)
-    }
-    pub(crate) fn write_to_buffer(self, handle: ResourceMemoryHandle, name: &str) -> Self {
-        self.write(ResourceDescription::PercistentBuffer { memory: handle }, name)
-    }
-    pub(crate) fn write_to_image(
-        self,
-        handle: ResourceMemoryHandle,
-        layout: vk::ImageLayout,
-        name: &str
-    ) -> Self {
-        if handle.ty() == ResourceMemoryType::ExternalReadonly {
-            panic!("attempting to write to readonly descriptor")
-        }
-        self.write(ResourceDescription::PercistentImage {
-            memory: handle,
-            layout,
-        }, name)
+
+        node.descriptor_buffer = self.rg.internal_buffer((node.num_bindings() * size_of::<usize>()) as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu);
+        self.rg.graph.push(node);
+        self.handle
     }
 }
 
@@ -255,13 +235,7 @@ impl<'b> NodeBuilder<'b, ComputePass> {
     }
     pub(crate) fn dispatch(mut self, dispatch: DispatchSize) -> NodeHandle {
         unsafe { self.execution.assume_init_mut() }.dispatch = dispatch;
-        self.rg.graph.push(Node {
-            reads: self.reads,
-            writes: self.writes,
-            descriptor_buffer: BufferHandle::default(),
-            execution: Box::new(unsafe { self.execution.assume_init() }),
-        });
-        self.handle
+        self.build()
     }
 }
 
@@ -334,13 +308,7 @@ impl<'b> NodeBuilder<'b, RayTracingPass> {
     }
     pub(crate) fn launch(mut self, launch: LaunchSize) -> NodeHandle {
         unsafe { self.execution.assume_init_mut() }.launch = launch;
-        self.rg.graph.push(Node {
-            reads: self.reads,
-            writes: self.writes,
-            descriptor_buffer: BufferHandle::default(),
-            execution: Box::new(unsafe { self.execution.assume_init() }),
-        });
-        self.handle
+        self.build()
     }
 }
 

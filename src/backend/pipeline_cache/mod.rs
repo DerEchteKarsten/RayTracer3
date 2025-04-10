@@ -126,9 +126,10 @@ impl PipelineCache {
             Some(pipeline) => pipeline,
             None => {
                 let entry = format!("{}\0", handle.entry);
-                let path = format!("./../../../shader/bin/{}.slang.spv", handle.path,);
+                let path = format!("./shaders/bin/{}.slang.spv", handle.path,);
 
                 let ctx = Context::get();
+                println!("{}", path);
                 let create_info = vk::ComputePipelineCreateInfo::default()
                     .layout(BindlessDescriptorHeap::get().layout)
                     .stage(
@@ -141,7 +142,7 @@ impl PipelineCache {
                         .create_compute_pipelines(vk::PipelineCache::null(), &[create_info], None)
                         .unwrap()
                 }[0];
-
+                ctx.set_debug_name(&handle.path, pipeline);
                 Self::get_mut()
                     .compute_pipelines
                     .insert(handle.clone(), pipeline);
@@ -188,6 +189,7 @@ impl PipelineCache {
                         ],
                     )
                     .unwrap();
+                Context::get().set_debug_name(&handle.path, pipeline);
                 Self::get_mut()
                     .raytracing_pipelines
                     .insert(handle.clone(), (pipeline, shader_binding_table));

@@ -1,7 +1,8 @@
-use std::mem::MaybeUninit;
+use std::{collections::VecDeque, mem::MaybeUninit};
 
 use anyhow::{Ok, Result};
 use ash::vk;
+use glam::UVec2;
 
 use crate::raytracing::AccelerationStructure;
 
@@ -11,19 +12,23 @@ use super::{
     vulkan::Context,
 };
 
-#[derive(Copy, Clone, Eq, PartialEq, Hash)]
-#[repr(transparent)]
-pub struct DescriptorResourceHandle(u32);
+pub(crate) struct ImmutableSampler(u32);
 
-impl DescriptorResourceHandle {
-    fn bump_version_and_update_tag(self, tag: RenderResourceTag) -> Self {
-        self
-    }
-
-    fn index(&self) -> u32 {
-        self.0
+impl ImmutableSampler {
+    pub fn new(mag_filter: vk::Filter, min_filter: vk::Filter) -> Result<Self> {
+        if mag_filter == vk::Filter::CUBIC_EXT || mag_filter == vk::Filter::CUBIC_IMG
+            || min_filter == vk::Filter::CUBIC_EXT || min_filter == vk::Filter::CUBIC_IMG {
+            Err(anyhow::Error::msg("Unsuported Sampler"))
+        }else {
+            Ok(Self((mag_filter == vk::Filter::NEAREST) as u32 | (min_filter == vk::Filter::NEAREST) as u32))
+        }
     }
 }
+
+
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+#[repr(C)]
+pub struct DescriptorResourceHandle(u32);
 
 enum AccessType {
     ReadOnly,
@@ -39,21 +44,39 @@ pub enum RenderResourceTag {
     AccelerationStructure,
 }
 
+impl RenderResourceTag {
+    fn table(&self) -> BindlessTableType {
+        match self {
+            Self::AccelerationStructure => BindlessTableType::AccelerationStructures,
+            Self::Buffer => BindlessTableType::Buffers,
+            Self::Image => BindlessTableType::Textures,
+            Self::Texture => BindlessTableType::Textures,
+        }
+    }
+}
+
 impl DescriptorResourceHandle {
-    pub fn new(
-        _version: u8,
-        _tag: RenderResourceTag,
-        index: u32,
-        _access_type: AccessType,
-    ) -> Self {
+    pub fn new(_version: u8, tag: RenderResourceTag, index: u32) -> Self {
+        // Self(((tag as u32) << 24) | index)
         Self(index)
+    }
+    fn bump_version_and_update_tag(self, tag: RenderResourceTag) -> Self {
+        self
+    }
+
+    fn index(&self) -> u32 {
+        self.0// self.0 & 0xffffff
+    }
+
+    pub fn to_bytes(&self) -> [u8; 4] {
+        self.0.to_ne_bytes()
     }
 }
 
 pub struct BindlessDescriptorHeap {
-    available_recycled_descriptors: Vec<DescriptorResourceHandle>,
+    available_recycled_descriptors: VecDeque<DescriptorResourceHandle>,
     descriptor_pool: vk::DescriptorPool,
-    descriptor_index: u32,
+    descriptor_index: [u32; 4],
     set_layouts: [vk::DescriptorSetLayout; 4],
     sets: [vk::DescriptorSet; 4],
     pub layout: vk::PipelineLayout,
@@ -102,7 +125,6 @@ impl BindlessTableType {
     fn table_size(&self) -> u32 {
         let ctx = Context::get();
         let raytracing_ctx = RayTracingContext::get();
-
         match self {
             BindlessTableType::Buffers => {
                 ctx.physical_device
@@ -149,39 +171,31 @@ impl BindlessTableType {
 
 impl BindlessDescriptorHeap {
     pub(crate) fn retire_handle(&mut self, handle: DescriptorResourceHandle) {
-        self.available_recycled_descriptors.push(handle);
+        self.available_recycled_descriptors.push_back(handle);
     }
 
-    fn increment_descriptor(&mut self) -> u32 {
-        let index = self.descriptor_index;
-        self.descriptor_index += 1;
+    fn increment_descriptor(&mut self, table: BindlessTableType) -> u32 {
+        let index = self.descriptor_index[table.set_index()];
+        self.descriptor_index[table.set_index()] += 1;
         index
     }
 
-    fn fetch_available_descriptor(
-        &mut self,
-        tag: RenderResourceTag,
-        access_type: AccessType,
-    ) -> DescriptorResourceHandle {
-        self.available_recycled_descriptors.pop().map_or_else(
-            || DescriptorResourceHandle::new(0, tag, self.increment_descriptor(), access_type),
+    fn fetch_available_descriptor(&mut self, tag: RenderResourceTag) -> DescriptorResourceHandle {
+        self.available_recycled_descriptors.pop_front().map_or_else(
+            || DescriptorResourceHandle::new(0, tag, self.increment_descriptor(tag.table())),
             |recycled_handle| recycled_handle.bump_version_and_update_tag(tag),
         )
     }
 
     pub fn allocate_buffer_handle(&mut self, buffer: &BufferHandle) -> DescriptorResourceHandle {
         let ctx = Context::get();
-        let handle = Self::fetch_available_descriptor(
-            self,
-            RenderResourceTag::Buffer,
-            AccessType::ReadWrite,
-        );
+        let handle = Self::fetch_available_descriptor(self, RenderResourceTag::Buffer);
 
-        let buffer_info = vk::DescriptorBufferInfo {
+        let buffer_info = [vk::DescriptorBufferInfo {
             buffer: buffer.buffer,
             offset: 0,
             range: vk::WHOLE_SIZE,
-        };
+        }];
 
         let write = [vk::WriteDescriptorSet {
             dst_set: self.sets[BindlessTableType::Buffers.set_index()],
@@ -189,7 +203,7 @@ impl BindlessDescriptorHeap {
             descriptor_count: 1,
             dst_array_element: handle.index(),
             descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
-            p_buffer_info: &buffer_info,
+            p_buffer_info: buffer_info.as_ptr(),
             ..Default::default()
         }];
         unsafe {
@@ -199,13 +213,9 @@ impl BindlessDescriptorHeap {
         handle
     }
 
-    pub fn allocate_storage_image_handle(
-        &mut self,
-        image: &ImageHandle,
-    ) -> DescriptorResourceHandle {
+    pub fn allocate_image_handle(&mut self, image: &ImageHandle) -> DescriptorResourceHandle {
         let ctx = Context::get();
-        let handle =
-            Self::fetch_available_descriptor(self, RenderResourceTag::Image, AccessType::ReadWrite);
+        let handle = Self::fetch_available_descriptor(self, RenderResourceTag::Image);
 
         let image_info = vk::DescriptorImageInfo {
             image_layout: vk::ImageLayout::GENERAL,
@@ -231,8 +241,7 @@ impl BindlessDescriptorHeap {
 
     pub fn allocate_texture_handle(&mut self, image: &ImageHandle) -> DescriptorResourceHandle {
         let ctx = Context::get();
-        let handle =
-            Self::fetch_available_descriptor(self, RenderResourceTag::Image, AccessType::ReadWrite);
+        let handle = Self::fetch_available_descriptor(self, RenderResourceTag::Image);
 
         let image_info = vk::DescriptorImageInfo {
             image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
@@ -256,11 +265,13 @@ impl BindlessDescriptorHeap {
         handle
     }
 
-
-    pub fn allocate_acceleration_structure_handle(&mut self, tlas: AccelerationStructure) -> DescriptorResourceHandle {
+    pub fn allocate_acceleration_structure_handle(
+        &mut self,
+        tlas: &AccelerationStructure,
+    ) -> DescriptorResourceHandle {
         let ctx = Context::get();
         let handle =
-            Self::fetch_available_descriptor(self, RenderResourceTag::AccelerationStructure, AccessType::ReadWrite);
+            Self::fetch_available_descriptor(self, RenderResourceTag::AccelerationStructure);
 
         let mut write_set_as = vk::WriteDescriptorSetAccelerationStructureKHR::default()
             .acceleration_structures(std::slice::from_ref(&tlas.accel));
@@ -279,8 +290,8 @@ impl BindlessDescriptorHeap {
         handle
     }
 
-    pub(crate) fn init(immutable_samplers: &[vk::Sampler]) {
-        unsafe { BINDLESS.write(Self::new(immutable_samplers)) };
+    pub(crate) fn init() {
+        unsafe { BINDLESS.write(Self::new()) };
     }
 
     pub(crate) fn get() -> &'static BindlessDescriptorHeap {
@@ -291,8 +302,17 @@ impl BindlessDescriptorHeap {
         unsafe { BINDLESS.assume_init_mut() }
     }
 
-    pub(crate) fn new(immutable_samplers: &[vk::Sampler]) -> Self {
+    pub(crate) fn new() -> Self {
         let ctx = Context::get();
+        let immutable_samplers: [vk::Sampler; 4] = (0..3).into_iter().map(|i: i32| {
+            let create_info = vk::SamplerCreateInfo {
+                min_filter: if i % 2 == 0 {vk::Filter::NEAREST} else {vk::Filter::LINEAR},
+                mag_filter: if i.div_floor(2) == 0 {vk::Filter::NEAREST} else {vk::Filter::LINEAR},
+                ..Default::default()
+            };
+            unsafe { ctx.device.create_sampler(&create_info, None).unwrap() }
+        }).collect::<Vec<vk::Sampler>>().try_into().unwrap();
+
         let descriptor_sizes =
             BindlessTableType::descriptor_pool_sizes(immutable_samplers.len() as u32);
 
@@ -306,20 +326,62 @@ impl BindlessDescriptorHeap {
                 .create_descriptor_pool(&descriptor_pool_info, None)
                 .unwrap()
         };
-        let (set_layouts, layout) = Self::create_bindless_layout(immutable_samplers);
+        ctx.set_debug_name("BindlessDescriptorPool", descriptor_pool);
+        let (set_layouts, layout) = Self::create_bindless_layout(&immutable_samplers);
+        ctx.set_debug_name("BindlessLayout", layout);
+        for i in 0..set_layouts.len() {
+            ctx.set_debug_name(
+                &format!(
+                    "BindlessDescriptorSetLayout_{}",
+                    match i {
+                        0 => "Buffers",
+                        1 => "Images",
+                        2 => "Tectures",
+                        3 => "Tlas",
+                        _ => unreachable!(),
+                    }
+                ),
+                set_layouts[i],
+            );
+        }
+
+        let descriptor_counts = BindlessTableType::all_tables()
+            .iter()
+            .map(|table| table.table_size())
+            .collect::<Vec<_>>();
+        let mut set_counts = vk::DescriptorSetVariableDescriptorCountAllocateInfo::default()
+            .descriptor_counts(&descriptor_counts);
 
         let allocate_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(descriptor_pool)
-            .set_layouts(&set_layouts);
+            .set_layouts(set_layouts.as_slice())
+            .push_next(&mut set_counts);
 
-        let sets = unsafe { ctx.device.allocate_descriptor_sets(&allocate_info).unwrap() }
-            .try_into()
-            .unwrap();
+        let sets: [vk::DescriptorSet; 4] =
+            unsafe { ctx.device.allocate_descriptor_sets(&allocate_info).unwrap() }
+                .try_into()
+                .unwrap();
+
+        for i in 0..sets.len() {
+            ctx.set_debug_name(
+                &format!(
+                    "BindlessDescriptorSet_{}",
+                    match i {
+                        0 => "Buffers",
+                        1 => "Images",
+                        2 => "Tectures",
+                        3 => "Tlas",
+                        _ => unreachable!(),
+                    }
+                ),
+                sets[i],
+            );
+        }
 
         Self {
             descriptor_pool,
-            available_recycled_descriptors: vec![],
-            descriptor_index: 0,
+            available_recycled_descriptors: VecDeque::new(),
+            descriptor_index: [0; 4],
             set_layouts,
             sets,
             layout,
@@ -330,7 +392,7 @@ impl BindlessDescriptorHeap {
         immutable_samplers: &[vk::Sampler],
     ) -> ([vk::DescriptorSetLayout; 4], vk::PipelineLayout) {
         let ctx = Context::get();
-        let mut descriptor_layouts = [vk::DescriptorSetLayout::null(); 4];
+        let mut descriptor_layouts = [vk::DescriptorSetLayout::default(); 4];
         BindlessTableType::all_tables()
             .iter()
             .enumerate()
@@ -382,7 +444,7 @@ impl BindlessDescriptorHeap {
                     .unwrap();
             });
 
-        let num_push_constants = 1;
+        let num_push_constants = 2;
         let num_push_constants_sized = std::mem::size_of::<u32>() as u32 * num_push_constants;
 
         let push_constant_range = vk::PushConstantRange {
@@ -404,7 +466,7 @@ impl BindlessDescriptorHeap {
         (descriptor_layouts, pipeline_layout)
     }
 
-    fn bind(&self, cmd: &vk::CommandBuffer) -> Result<()> {
+    pub fn bind(&self, cmd: &vk::CommandBuffer) -> Result<()> {
         let ctx = Context::get();
 
         unsafe {

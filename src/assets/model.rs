@@ -2,12 +2,10 @@ use std::mem::{size_of, size_of_val};
 
 use super::gltf::{self, Vertex};
 use crate::backend::{
-    vulkan::raytracing::{AccelerationStructure, RayTracingContext},
-    vulkan::utils::{Buffer, Image, ImageResource},
-    vulkan::Context,
+    bindless::{DescriptorResourceHandle, ImmutableSampler}, vulkan::{raytracing::{AccelerationStructure, RayTracingContext}, utils::{Buffer, Image, ImageResource}, Context}
 };
 use anyhow::Result;
-use ash::vk::{self, Packed24_8};
+use ash::vk::{self, Filter, Packed24_8};
 use glam::{Mat4, Vec4};
 use gpu_allocator::MemoryLocation;
 
@@ -16,7 +14,7 @@ use gpu_allocator::MemoryLocation;
 pub struct GeometryInfo {
     pub transform: Mat4,
     pub base_color: [f32; 4],
-    pub base_color_texture_index: i32,
+    pub base_color_texture_index: DescriptorResourceHandle,
     pub metallic_factor: f32,
     pub index_offset: u32,
     pub vertex_offset: u32,
@@ -27,8 +25,6 @@ pub struct GeometryInfo {
 pub struct Model {
     pub index_count: u32,
     pub images: Vec<ImageResource>,
-    pub samplers: Vec<vk::Sampler>,
-    pub textures: Vec<(usize, usize)>,
     pub blas: AccelerationStructure,
     pub vertex_buffer: Buffer,
     pub index_buffer: Buffer,
@@ -163,7 +159,7 @@ impl Model {
     //     })
     // }
 
-    fn map_gltf_sampler<'a>(sampler: &gltf::Sampler) -> vk::SamplerCreateInfo {
+    fn map_gltf_sampler<'a>(sampler: &gltf::Sampler) -> ImmutableSampler {
         let mag_filter = match sampler.mag_filter {
             gltf::MagFilter::Linear => vk::Filter::LINEAR,
             gltf::MagFilter::Nearest => vk::Filter::NEAREST,
@@ -178,9 +174,7 @@ impl Model {
             | gltf::MinFilter::NearestMipmapNearest => vk::Filter::NEAREST,
         };
 
-        vk::SamplerCreateInfo::default()
-            .mag_filter(mag_filter)
-            .min_filter(min_filter)
+        ImmutableSampler::new(mag_filter, min_filter).unwrap()
     }
 
     pub fn from_gltf(model: gltf::Model) -> Result<Self> {
@@ -306,27 +300,13 @@ impl Model {
             .samplers
             .iter()
             .map(|s| {
-                let sampler_info = Self::map_gltf_sampler(s);
-                unsafe { ctx.device.create_sampler(&sampler_info, None) }.unwrap()
+                Self::map_gltf_sampler(s)
             })
             .collect::<Vec<_>>();
 
         //Dummy sampler
         if samplers.is_empty() {
-            let sampler_info = vk::SamplerCreateInfo {
-                mag_filter: vk::Filter::LINEAR,
-                min_filter: vk::Filter::LINEAR,
-                mipmap_mode: vk::SamplerMipmapMode::LINEAR,
-                address_mode_u: vk::SamplerAddressMode::MIRRORED_REPEAT,
-                address_mode_v: vk::SamplerAddressMode::MIRRORED_REPEAT,
-                address_mode_w: vk::SamplerAddressMode::MIRRORED_REPEAT,
-                max_anisotropy: 1.0,
-                border_color: vk::BorderColor::FLOAT_OPAQUE_WHITE,
-                compare_op: vk::CompareOp::NEVER,
-                ..Default::default()
-            };
-            let sampler = unsafe { ctx.device.create_sampler(&sampler_info, None) }.unwrap();
-            samplers.push(sampler);
+            samplers.push(ImmutableSampler::new(Filter::LINEAR, Filter::LINEAR).unwrap());
         }
 
         let mut textures = model
@@ -389,7 +369,7 @@ impl Model {
                 1.0,
             ];
             if emission[0] != 0.0 || emission[1] != 0.0 || emission[2] != 0.0 {
-                lights += mesh.index_count / 3;
+                lights += primitive_count;
             }
             geometry_infos.push(GeometryInfo {
                 transform: Mat4::from_cols_array_2d(&node.transform),
@@ -441,7 +421,6 @@ impl Model {
         Ok(Self {
             index_count: indices.len() as u32,
             images,
-            samplers,
             textures,
             geometry_infos,
             blas,

@@ -73,7 +73,6 @@ impl RayTracingContext {
                 ctx.physical_device.handel,
                 &mut physical_device_properties2,
             );
-            debug!("{:?}", subgroups);
             (rt_pipeline_properties, acc_properties)
         };
         let pipeline_fn = ash::khr::ray_tracing_pipeline::Device::new(&ctx.instance, &ctx.device);

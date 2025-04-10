@@ -16,7 +16,8 @@ use anyhow::Result;
 use ash::{
     ext::{debug_utils, extended_dynamic_state3, mesh_shader},
     khr::*,
-    vk, Device, Entry, Instance,
+    vk::{self, Handle},
+    Device, Entry, Instance,
 };
 use gpu_allocator::{
     vulkan::{Allocator, AllocatorCreateDesc},
@@ -96,13 +97,14 @@ impl Context {
         if p_callback_data != std::ptr::null() && (*p_callback_data).p_message != std::ptr::null() {
             let message = CStr::from_ptr((*p_callback_data).p_message);
             match flag {
-                Flag::VERBOSE => log::info!("{:?} - {:?}", typ, message),
-                Flag::INFO => {
-                    let message = message.to_str().unwrap_or("");
-                    log::info!("{:?} - {:?}", typ, message.to_owned())
-                }
-                Flag::WARNING => log::warn!("{:?} - {:?}", typ, message),
-                _ => log::error!("{:?} - {:?}", typ, message),
+                // Flag::VERBOSE => log::info!("{:?} - {:?}", typ, message),
+                // Flag::INFO => {
+                //     let message = message.to_str().unwrap_or("");
+                //     log::info!("{:?} - {:?}", typ, message.to_owned())
+                // }
+                Flag::WARNING => log::warn!("{:?}", message),
+                Flag::ERROR => log::error!("{:?}", message),
+                _ => {}
             }
         }
         vk::FALSE
@@ -344,13 +346,19 @@ impl Context {
             vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default().ray_tracing_pipeline(true);
         let mut acceleration_struct_feature =
             vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
-                .acceleration_structure(true);
+                .acceleration_structure(true)
+                .descriptor_binding_acceleration_structure_update_after_bind(true);
         let mut vulkan_12_features = vk::PhysicalDeviceVulkan12Features::default()
             .runtime_descriptor_array(true)
             .buffer_device_address(true)
             .descriptor_indexing(true)
             .shader_sampled_image_array_non_uniform_indexing(true)
-            .shader_float16(true);
+            .shader_float16(true)
+            .descriptor_binding_storage_buffer_update_after_bind(true)
+            .descriptor_binding_partially_bound(true)
+            .descriptor_binding_variable_descriptor_count(true)
+            .descriptor_binding_storage_image_update_after_bind(true)
+            .descriptor_binding_sampled_image_update_after_bind(true);
         let mut vulkan_13_features = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
             .maintenance4(true)
@@ -493,5 +501,17 @@ impl Context {
         };
 
         Ok(())
+    }
+
+    pub(crate) fn set_debug_name<T>(&self, name: &str, object: T)
+    where
+        T: Handle,
+    {
+        let name = format!("{}\0", name);
+        let name = CStr::from_bytes_with_nul(name.as_bytes()).unwrap();
+        let name_info = vk::DebugUtilsObjectNameInfoEXT::default()
+            .object_handle(object)
+            .object_name(name);
+        unsafe { self.debug_utils.set_debug_utils_object_name(&name_info) }.unwrap();
     }
 }

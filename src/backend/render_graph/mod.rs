@@ -1,17 +1,19 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, ffi::c_void};
 
 use anyhow::Result;
-use ash::vk;
+use ash::vk::{self, Format};
 use build::ImageSize;
 use derivative::Derivative;
 use glam::UVec2;
 use gpu_allocator::MemoryLocation;
 
+use crate::raytracing::AccelerationStructure;
+
 use super::{
     bindless::{BindlessDescriptorHeap, DescriptorResourceHandle},
     vulkan::{
         swapchain::{Swapchain, FRAMES_IN_FLIGHT},
-        utils::{Buffer, BufferHandle, ImageHandle, ImageResource},
+        utils::{Buffer, BufferHandle, Image, ImageHandle, ImageResource},
         Context,
     },
 };
@@ -19,53 +21,45 @@ use super::{
 pub mod bake;
 pub mod build;
 
-const IMPORTED: NodeHandle = !0;
+pub const IMPORTED: NodeHandle = !0;
 
-#[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub struct ResourceMemoryHandle(u32);
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+pub struct ResourceHandle(u32);
 
 #[derive(PartialEq)]
 enum ResourceMemoryType {
     ImportedBuffer = 0,
     ImportedImage = 1,
-    PercistentBuffer = 2,
-    PercistentImage = 3,
-    TransientBuffer = 4,
-    TransientImage = 5,
-    ExternalReadonly = 6,
+    Buffer = 2,
+    Image = 3,
+    ExternalReadonly = 4,
+    Swapchain = 5,
 }
 
-impl ResourceMemoryHandle {
-    fn new(ty: ResourceMemoryType, index: usize) -> Self {
+impl ResourceHandle {
+    const fn new(ty: ResourceMemoryType, index: usize) -> Self {
         Self((ty as u8 as u32) << 24u32 | index as u32)
     }
     fn index(&self) -> usize {
         (self.0 & !(0xff << 24)) as usize
     }
     fn descriptor(&self) -> usize {
-        match (self.0 >> 24) as usize {
-            0 => 0,
-            1 => 1,
-            2 => 2,
-            3 => 3,
-            4 => 2,
-            5 => 3,
-            _ => unreachable!(),
-        }
+        (self.0 >> 24) as usize
     }
     fn ty(&self) -> ResourceMemoryType {
         match self.0 >> 24 {
             0 => ResourceMemoryType::ImportedBuffer,
             1 => ResourceMemoryType::ImportedImage,
-            2 => ResourceMemoryType::PercistentBuffer,
-            3 => ResourceMemoryType::PercistentImage,
-            4 => ResourceMemoryType::TransientBuffer,
-            5 => ResourceMemoryType::TransientImage,
-            6 => ResourceMemoryType::ExternalReadonly,
+            2 => ResourceMemoryType::Buffer,
+            3 => ResourceMemoryType::Image,
+            4 => ResourceMemoryType::ExternalReadonly,
+            5 => ResourceMemoryType::Swapchain,
             _ => unreachable!(),
         }
     }
 }
+
+pub const SWPACHAIN: ResourceHandle = ResourceHandle::new(ResourceMemoryType::Swapchain, 0xffffff);
 
 type NodeHandle = usize;
 
@@ -76,9 +70,12 @@ pub(crate) trait Execution {
 
 struct Node {
     execution: Box<dyn Execution>,
-    descriptor_buffer: BufferHandle,
+    descriptor_buffer: ResourceHandle,
+    constants_buffer: Option<ResourceHandle>,
     reads: Vec<NodeEdge>,
     writes: Vec<NodeEdge>,
+    constants: Option<*const c_void>,
+    constants_size: usize,
 }
 
 impl PartialEq for Node {
@@ -117,6 +114,16 @@ impl Node {
                 })
                 .is_some()
     }
+
+    fn num_bindings(&self) -> usize {
+        let mut bindings = self.reads.iter().map(|e| e.resource).collect::<Vec<_>>();
+        self.writes.iter().for_each(|e| {
+            if !bindings.contains(&e.resource) {
+                bindings.push(e.resource);
+            }
+        });
+        bindings.len() + self.constants.is_some() as usize
+    }
 }
 
 #[derive(Clone)]
@@ -126,79 +133,7 @@ struct FrameData {
     frame_number: u64,
 }
 
-impl FrameData {
-    pub fn record_command_buffer<F>(
-        &mut self,
-        wait_semaphore: vk::Semaphore,
-        swapchain: &Swapchain,
-        frame_in_flight: usize,
-        func: F,
-    ) where
-        F: FnOnce(vk::CommandBuffer),
-    {
-        let ctx = Context::get();
-        let semaphore = [wait_semaphore];
-        let values = [self.frame_number];
-        let wait_info = vk::SemaphoreWaitInfo::default()
-            .semaphores(&semaphore)
-            .values(&values);
-        unsafe { ctx.device.wait_semaphores(&wait_info, 1000000000).unwrap() };
-        unsafe {
-            ctx.device
-                .reset_command_pool(self.command_pool, vk::CommandPoolResetFlags::empty())
-                .unwrap()
-        };
-
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-
-        unsafe {
-            ctx.device
-                .begin_command_buffer(self.cmd, &begin_info)
-                .unwrap()
-        };
-
-        func(self.cmd.clone());
-
-        unsafe { ctx.device.end_command_buffer(self.cmd).unwrap() };
-
-        let wait_semaphores = [vk::SemaphoreSubmitInfo::default()
-            .semaphore(swapchain.frame_resources[frame_in_flight].image_availible_semaphore)
-            .stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)];
-
-        let signal_frame_value = self.frame_number + FRAMES_IN_FLIGHT as u64;
-        self.frame_number = signal_frame_value;
-
-        let signal_semaphores = [
-            vk::SemaphoreSubmitInfo::default()
-                .semaphore(
-                    swapchain.frame_resources[frame_in_flight as usize].render_finished_semaphore,
-                )
-                .stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE),
-            vk::SemaphoreSubmitInfo::default()
-                .semaphore(wait_semaphore)
-                .stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)
-                .value(signal_frame_value),
-        ];
-
-        let command_buffers = [vk::CommandBufferSubmitInfo::default().command_buffer(self.cmd)];
-
-        let submit = vk::SubmitInfo2::default()
-            .command_buffer_infos(&command_buffers)
-            .signal_semaphore_infos(&signal_semaphores)
-            .wait_semaphore_infos(&wait_semaphores);
-
-        unsafe {
-            ctx.device
-                .queue_submit2(ctx.graphics_queue, &[submit], vk::Fence::null())
-                .unwrap()
-        };
-    }
-}
-
 pub struct RenderGraph {
-    trainsient_resource_cache: HashMap<ResourceDescription, ResourceMemoryHandle>,
-
     external_image_handles: Vec<ImageHandle>,
     external_buffer_handles: Vec<BufferHandle>,
 
@@ -213,95 +148,16 @@ pub struct RenderGraph {
     frame_data: [FrameData; FRAMES_IN_FLIGHT],
     frame_timeline_semaphore: vk::Semaphore,
     swapchain: Swapchain,
+    swapchain_image_descriptors: Vec<DescriptorResourceHandle>,
     pub frame_number: u64,
-    output: Option<(NodeHandle, usize)>,
-}
-
-#[derive(Derivative, Clone, Debug)]
-#[derivative(PartialEq, Eq, Hash)]
-pub enum ResourceDescription {
-    Image {
-        index: usize,
-        format: vk::Format,
-        size: UVec2,
-        usage: vk::ImageUsageFlags,
-        #[derivative(PartialEq = "ignore")]
-        #[derivative(Hash = "ignore")]
-        layout: vk::ImageLayout,
-    },
-    Buffer {
-        index: usize,
-        size: u64,
-        usage: vk::BufferUsageFlags,
-    },
-    PercistentBuffer {
-        #[derivative(PartialEq = "ignore")]
-        #[derivative(Hash = "ignore")]
-        memory: ResourceMemoryHandle,
-    },
-    PercistentImage {
-        #[derivative(PartialEq = "ignore")]
-        #[derivative(Hash = "ignore")]
-        layout: vk::ImageLayout,
-        #[derivative(PartialEq = "ignore")]
-        #[derivative(Hash = "ignore")]
-        memory: ResourceMemoryHandle,
-    },
-}
-
-impl ResourceDescription {
-    pub fn eql(&self, other: &ResourceDescription) -> bool {
-        if std::mem::discriminant(self) != std::mem::discriminant(other) {
-            return false;
-        }
-
-        match self {
-            Self::Buffer {
-                index: _,
-                size,
-                usage,
-            } => match other {
-                Self::Buffer {
-                    index: _,
-                    size: s,
-                    usage: u,
-                } => *size == *s && *usage == *u,
-                _ => unreachable!(),
-            },
-            Self::Image {
-                index: _,
-                format,
-                size,
-                usage,
-                layout: _,
-            } => match other {
-                Self::Image {
-                    index: _,
-                    size: s,
-                    usage: u,
-                    format: f,
-                    layout: _,
-                } => *size == *s && *usage == *u && *format == *f,
-                _ => unreachable!(),
-            },
-            _ => other == self,
-        }
-    }
-    pub fn get_layout(&self) -> Option<vk::ImageLayout> {
-        match self {
-            Self::Image { layout, .. } => Some(*layout),
-            Self::PercistentImage { layout, .. } => Some(*layout),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Clone, PartialEq)]
 struct NodeEdge {
     output_of: NodeHandle,
     output_index: usize,
-    description: ResourceDescription,
-    name: String,
+    resource: ResourceHandle,
+    layout: Option<vk::ImageLayout>,
 }
 
 impl NodeEdge {
@@ -309,6 +165,12 @@ impl NodeEdge {
         &rg.graph[self.output_of]
     }
 }
+
+trait Importable {}
+
+impl Importable for BufferHandle {}
+impl Importable for AccelerationStructure {}
+impl Importable for ImageHandle {}
 
 impl RenderGraph {
     pub fn new() -> Self {
@@ -347,14 +209,18 @@ impl RenderGraph {
                 command_pool,
             }
         }
+        let swapchain = Swapchain::new().unwrap();
+        let swapchain_image_descriptors = swapchain
+            .images
+            .iter()
+            .map(|image| BindlessDescriptorHeap::get_mut().allocate_image_handle(&image.handle()))
+            .collect::<Vec<_>>();
 
         Self {
-            trainsient_resource_cache: HashMap::new(),
             graph: Vec::new(),
-            swapchain: Swapchain::new().unwrap(),
+            swapchain,
             frame_data,
             frame_number: 0,
-            output: None,
             external_buffer_handles: Vec::new(),
             external_image_handles: Vec::new(),
             internal_buffers: Vec::new(),
@@ -362,6 +228,7 @@ impl RenderGraph {
             descriptor_handles: [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             execution_order: Vec::new(),
             frame_timeline_semaphore,
+            swapchain_image_descriptors,
         }
     }
 
@@ -369,101 +236,87 @@ impl RenderGraph {
         self.swapchain.format
     }
 
-    pub fn set_output(&mut self, node: NodeHandle, index: usize) {
-        self.output = Some((node, index));
-    }
-
-    pub fn import(&mut self, desc: DescriptorResourceHandle) -> ResourceMemoryHandle {
+    fn import(&mut self, desc: DescriptorResourceHandle) -> ResourceHandle {
         let index = self.descriptor_handles[4].len();
         self.descriptor_handles[4].push(desc);
-        ResourceMemoryHandle::new(ResourceMemoryType::ExternalReadonly, index)
+        ResourceHandle::new(ResourceMemoryType::ExternalReadonly, index)
+    }
+    pub fn import_tlas(&mut self, tlas: &AccelerationStructure) -> ResourceHandle {
+        let desc = BindlessDescriptorHeap::get_mut().allocate_acceleration_structure_handle(tlas);
+        self.import(desc)
+    }
+    pub fn import_image(&mut self, image: &ImageHandle) -> ResourceHandle {
+        let desc = BindlessDescriptorHeap::get_mut().allocate_image_handle(image);
+        self.import(desc)
+    }
+    pub fn import_buffer(&mut self, buffer: &BufferHandle) -> ResourceHandle {
+        let desc = BindlessDescriptorHeap::get_mut().allocate_buffer_handle(buffer);
+        self.import(desc)
     }
 
-    pub fn import_storage_buffer(&mut self, buffer: BufferHandle) -> ResourceMemoryHandle {
-        let index = self.external_buffer_handles.len();
-        let memory = ResourceMemoryHandle::new(ResourceMemoryType::ImportedBuffer, index);
-        self.descriptor_handles[memory.descriptor()]
-            .push(BindlessDescriptorHeap::get_mut().allocate_buffer_handle(&buffer));
+    pub fn import_storage_buffer(&mut self, buffer: BufferHandle) -> ResourceHandle {
+        let handle = self.buffer_resource(&buffer, false);
         self.external_buffer_handles.push(buffer);
-        memory
+        handle
     }
-
-    pub fn import_read_write_image(&mut self, image: ImageHandle) -> ResourceMemoryHandle {
-        let index = self.external_image_handles.len();
-        let memory = ResourceMemoryHandle::new(ResourceMemoryType::ImportedImage, index);
-        self.descriptor_handles[memory.descriptor()]
-            .push(BindlessDescriptorHeap::get_mut().allocate_storage_image_handle(&image));
-        self.external_image_handles.push(image);
-        memory
+    pub fn buffer(&mut self, size: u64, usage: vk::BufferUsageFlags) -> ResourceHandle {
+        self.internal_buffer(size, usage, MemoryLocation::GpuOnly)
     }
-
-    pub fn import_read_write_texture(&mut self, texture: ImageHandle) -> ResourceMemoryHandle {
-        let index = self.external_image_handles.len();
-        let memory = ResourceMemoryHandle::new(ResourceMemoryType::ImportedImage, index);
-        self.descriptor_handles[memory.descriptor()]
-            .push(BindlessDescriptorHeap::get_mut().allocate_texture_handle(&texture));
-        self.external_image_handles.push(texture);
-        memory
-    }
-
-    pub fn percistent_buffer(
-        &mut self,
-        size: u64,
-        usage: vk::BufferUsageFlags,
-    ) -> ResourceMemoryHandle {
-        let buffer = Buffer::new(usage, gpu_allocator::MemoryLocation::GpuOnly, size).unwrap();
-        let index = self.internal_buffers.len();
+    
+    fn internal_buffer(&mut self, size: u64, usage: vk::BufferUsageFlags, location: MemoryLocation) -> ResourceHandle {
+        let buffer = Buffer::new(usage, location, size).unwrap();
+        let handle = self.buffer_resource(&buffer.handle(), true);
         self.internal_buffers.push(buffer);
-        ResourceMemoryHandle::new(ResourceMemoryType::PercistentBuffer, index)
+        handle
+    }
+    fn buffer_resource(&mut self, buffer: &BufferHandle, internal: bool) -> ResourceHandle {
+        let index = if internal {self.internal_buffers.len()} else {self.external_buffer_handles.len()};
+        let desc = BindlessDescriptorHeap::get_mut().allocate_buffer_handle(&buffer);
+        let handle = ResourceHandle::new(ResourceMemoryType::Buffer, index);
+        self.descriptor_handles[handle.descriptor()].push(desc);
+        handle
     }
 
-    fn percistent_image(
-        &mut self,
-        format: vk::Format,
-        usage: vk::ImageUsageFlags,
-        size: ImageSize,
-    ) -> ResourceMemoryHandle {
+    pub fn import_storage_image(&mut self, image: ImageHandle) -> ResourceHandle {
+        let handle = self.image_resource(&image, false);
+        self.external_image_handles.push(image);
+        handle
+    }
+    pub fn image(&mut self, size: ImageSize, usage: vk::ImageUsageFlags, format: Format) -> ResourceHandle {
+        self.internal_image(size, usage, format, MemoryLocation::GpuOnly)
+    }
+    
+    fn internal_image(&mut self, size: ImageSize, usage: vk::ImageUsageFlags, format: Format, location: MemoryLocation) -> ResourceHandle {
         let size = size.size();
-        let image =
-            ImageResource::new_2d(usage, MemoryLocation::GpuOnly, format, size.x, size.y).unwrap();
-        let index = self.internal_images.len();
+        let image = ImageResource::new_2d(usage, location, format, size.x, size.y).unwrap();
+        let handle = self.image_resource(&image.handle(), true);
         self.internal_images.push(image);
-        ResourceMemoryHandle::new(ResourceMemoryType::PercistentImage, index)
+        handle
+    }
+    fn image_resource(&mut self, image: &ImageHandle, internal: bool) -> ResourceHandle {
+        let index = if internal {self.internal_images.len()} else {self.external_image_handles.len()};
+        let desc = BindlessDescriptorHeap::get_mut().allocate_image_handle(&image);
+        let handle = ResourceHandle::new(ResourceMemoryType::Image, index);
+        self.descriptor_handles[handle.descriptor()].push(desc);
+        handle
     }
 
-    fn get_handle(&self, desc: &ResourceDescription) -> ResourceMemoryHandle {
-        match desc {
-            ResourceDescription::PercistentBuffer { memory } => memory.clone(),
-            ResourceDescription::PercistentImage { layout: _, memory } => memory.clone(),
-            _ => self.trainsient_resource_cache[desc].clone(),
-        }
-    }
-
-    fn image_handle<'a>(&'a self, handle: ResourceMemoryHandle) -> Option<ImageHandle> {
+    fn image_handle<'a>(&'a self, handle: ResourceHandle, swapchain_image: usize) -> Option<ImageHandle> {
         match handle.ty() {
             ResourceMemoryType::ImportedImage => {
                 Some(self.external_image_handles[handle.index()].clone())
             }
-            ResourceMemoryType::PercistentImage => {
-                Some(self.internal_images[handle.index()].handle())
-            }
-            ResourceMemoryType::TransientImage => {
-                Some(self.internal_images[handle.index()].handle())
-            }
+            ResourceMemoryType::Image => Some(self.internal_images[handle.index()].handle()),
+            ResourceMemoryType::Swapchain => Some(self.swapchain.images[swapchain_image].handle()),
             _ => None,
         }
     }
-    fn buffer_handle<'a>(&'a self, handle: ResourceMemoryHandle) -> Option<BufferHandle> {
+    fn buffer_handle<'a>(&'a self, handle: ResourceHandle) -> Option<BufferHandle> {
         match handle.ty() {
             ResourceMemoryType::ImportedBuffer => {
                 Some(self.external_buffer_handles[handle.index()].clone())
             }
-            ResourceMemoryType::PercistentBuffer => {
-                Some(self.internal_buffers[handle.index()].handle())
-            }
-            ResourceMemoryType::TransientBuffer => {
-                Some(self.internal_buffers[handle.index()].handle())
-            }
+            ResourceMemoryType::Buffer => Some(self.internal_buffers[handle.index()].handle()),
             _ => None,
         }
     }
