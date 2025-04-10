@@ -2,7 +2,7 @@ use std::mem::{size_of, size_of_val};
 
 use super::gltf::{self, Vertex};
 use crate::backend::{
-    bindless::{DescriptorResourceHandle, ImmutableSampler}, vulkan::{raytracing::{AccelerationStructure, RayTracingContext}, utils::{Buffer, Image, ImageResource}, Context}
+    bindless::{BindlessDescriptorHeap, DescriptorResourceHandle, ImmutableSampler}, vulkan::{raytracing::{AccelerationStructure, RayTracingContext}, utils::{Buffer, Image, ImageResource}, Context}
 };
 use anyhow::Result;
 use ash::vk::{self, Filter, Packed24_8};
@@ -13,8 +13,9 @@ use gpu_allocator::MemoryLocation;
 #[repr(C)]
 pub struct GeometryInfo {
     pub transform: Mat4,
-    pub base_color: [f32; 4],
-    pub base_color_texture_index: DescriptorResourceHandle,
+    pub color: [f32; 4],
+    pub color_texture: DescriptorResourceHandle,
+    pub sampler: ImmutableSampler,
     pub metallic_factor: f32,
     pub index_offset: u32,
     pub vertex_offset: u32,
@@ -296,29 +297,7 @@ impl Model {
             images.push(image);
         }
 
-        let mut samplers = model
-            .samplers
-            .iter()
-            .map(|s| {
-                Self::map_gltf_sampler(s)
-            })
-            .collect::<Vec<_>>();
-
-        //Dummy sampler
-        if samplers.is_empty() {
-            samplers.push(ImmutableSampler::new(Filter::LINEAR, Filter::LINEAR).unwrap());
-        }
-
-        let mut textures = model
-            .textures
-            .iter()
-            .map(|t| (t.image_index, t.sampler_index))
-            .collect::<Vec<_>>();
-
-        // Dummy texture
-        if textures.is_empty() {
-            textures.push((0, 0));
-        }
+        let descriptor_handels = images.iter().map(|e| {BindlessDescriptorHeap::get_mut().allocate_texture_handle(&e.handle())}).collect::<Vec<_>>();
 
         let vertex_buffer = Buffer::from_data(
             vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
@@ -371,14 +350,16 @@ impl Model {
             if emission[0] != 0.0 || emission[1] != 0.0 || emission[2] != 0.0 {
                 lights += primitive_count;
             }
+            let texture = model.textures[mesh
+            .material
+            .base_color_texture_index
+            .map_or(0, |i| i as _)];
             geometry_infos.push(GeometryInfo {
                 transform: Mat4::from_cols_array_2d(&node.transform),
-                base_color: mesh.material.base_color,
+                color: mesh.material.base_color,
                 emission,
-                base_color_texture_index: mesh
-                    .material
-                    .base_color_texture_index
-                    .map_or(-1, |i| i as _),
+                color_texture: descriptor_handels[texture.image_index as usize],
+                sampler: Self::map_gltf_sampler(&model.samplers[texture.sampler_index as usize]),
                 metallic_factor: mesh.material.metallic_factor,
                 vertex_offset: mesh.vertex_offset,
                 index_offset: mesh.index_offset,
@@ -421,7 +402,6 @@ impl Model {
         Ok(Self {
             index_count: indices.len() as u32,
             images,
-            textures,
             geometry_infos,
             blas,
             index_counts,

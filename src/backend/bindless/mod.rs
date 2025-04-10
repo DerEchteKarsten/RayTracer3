@@ -12,6 +12,8 @@ use super::{
     vulkan::Context,
 };
 
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
 pub(crate) struct ImmutableSampler(u32);
 
 impl ImmutableSampler {
