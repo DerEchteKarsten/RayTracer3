@@ -1,15 +1,21 @@
-use std::collections::{HashMap, VecDeque};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    os::raw::c_void,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Error, Result};
 use ash::vk;
 
 use crate::{
     backend::bindless::BindlessDescriptorHeap,
-    vulkan::{swapchain::FRAMES_IN_FLIGHT, utils::Buffer, Context}, GConst,
+    vulkan::{buffer::Buffer, image::ImageType, swapchain::FRAMES_IN_FLIGHT, Context},
+    GConst,
 };
 
 use super::{
-    Node, NodeHandle, RenderGraph, ResourceHandle, ResourceMemoryType, IMPORTED, SWPACHAIN,
+    EdgeType, ExecutionTrait, Node, NodeEdge, NodeHandle, RenderGraph, ResourceHandle,
+    ResourceMemoryType, IMPORTED,
 };
 
 impl RenderGraph {
@@ -36,16 +42,10 @@ impl RenderGraph {
         flatt
     }
 
-    pub fn bake(&mut self) -> Result<()> {
-        let root_node = self
-            .graph
-            .iter()
-            .position(|n| n.writes.iter().find(|e| e.resource == SWPACHAIN).is_some())
-            .expect("No writes to SWAPCHAIN found");
-
+    pub fn bake(&mut self, root_node: NodeHandle) -> Result<Vec<NodeHandle>> {
         let mut unschedueld_passes = self.flatten(root_node);
-        self.execution_order.clear();
-        self.execution_order.push(unschedueld_passes[0]);
+        let mut execution_order = Vec::new();
+        execution_order.push(unschedueld_passes[0]);
         unschedueld_passes.remove(0);
 
         while !unschedueld_passes.is_empty() {
@@ -54,7 +54,7 @@ impl RenderGraph {
 
             for i in 0..unschedueld_passes.len() {
                 let mut overlap_factor = 0;
-                for j in self.execution_order.iter().rev() {
+                for j in execution_order.iter().rev() {
                     if self.graph[unschedueld_passes[i]].depends_on(self, &self.graph[*j]) {
                         break;
                     }
@@ -79,51 +79,65 @@ impl RenderGraph {
                     best_overlap_factor = overlap_factor;
                 }
             }
-            self.execution_order
-                .push(unschedueld_passes[best_candidate]);
+            execution_order.push(unschedueld_passes[best_candidate]);
             unschedueld_passes.remove(best_candidate);
         }
-        Ok(())
+        Ok(execution_order)
     }
 
-    pub fn write_bindings(&mut self, swapchain_image_index: usize) -> Result<()> {
-        for pass_index in &self.execution_order {
-            let pass = &mut self.graph[*pass_index];
-            let mut bindings = vec![];
-            if let Some(buffer) = pass.constants_buffer {
-                bindings.push(self.descriptor_handles[buffer.descriptor()][buffer.index()]);
-            }
-            pass
-                .reads
+    pub fn write_bindings(&mut self) -> Result<()> {
+        for (pass_index, pass) in self.graph.iter().enumerate() {
+            let descriptor_buffer_offset = &self.graph[0..pass_index]
                 .iter()
-                .for_each(|e| {
-                    bindings.push(self.descriptor_handles[e.resource.descriptor()][e.resource.index()])
-                });
-            pass.writes.iter().for_each(|e| {
-                if e.resource == SWPACHAIN {
-                    bindings.push(self.swapchain_image_descriptors[swapchain_image_index]);
-                }else {
-                    let desc = &self.descriptor_handles[e.resource.descriptor()][e.resource.index()];
-                    if !bindings.contains(&desc) {
-                        bindings.push(*desc);
-                    }
-                }
-            });
+                .fold(0, |acc, e| acc + e.bindings().count());
 
-            if let Some(constants) = pass.constants {
-                let buffer = &self.internal_buffers[pass.constants_buffer.unwrap().index()];
-                println!("{}", unsafe { *(constants as *const i32) });
-                unsafe {constants.copy_to(buffer.allocation.mapped_ptr().unwrap().as_ptr(), pass.constants_size) };
+            if pass.bindings().count() != 0 {
+                let bindings = pass
+                    .bindings()
+                    .map(|e| self.resources[e.resource.index()].descriptor)
+                    .collect::<Vec<_>>();
+
+                unsafe {
+                    (self.resources[self.descriptor_buffer.index()]
+                        .ty
+                        .buffer()
+                        .allocation
+                        .as_ref()
+                        .unwrap()
+                        .mapped_ptr()
+                        .unwrap()
+                        .as_ptr()
+                        .add(*descriptor_buffer_offset))
+                    .copy_from(
+                        bindings.as_ptr() as *const c_void,
+                        bindings.len() * size_of::<u32>(),
+                    )
+                };
             }
-            
-            self.internal_buffers[pass.descriptor_buffer.index()].copy_data_to_buffer(&bindings)?;
-            println!("{:?}", bindings)
         }
+
+        let buffer_ptr = self.resources[self.constants_buffer.index()]
+            .ty
+            .buffer()
+            .allocation
+            .as_ref()
+            .unwrap()
+            .mapped_ptr()
+            .unwrap()
+            .as_ptr() as *mut c_void;
+        self.constants_cache.iter().for_each(|(constants, offset)| {
+            unsafe {
+                constants
+                    .pointer
+                    .copy_to(buffer_ptr.add(*offset), constants.size)
+            };
+        });
+
         Ok(())
     }
-
-    //TODO Error Handeling
-    pub fn draw(&mut self) {
+    pub fn begin_frame(&mut self) {
+        self.constants_cache.clear();
+        self.graph.clear();
         let frame_in_flight = self.frame_number as usize % FRAMES_IN_FLIGHT;
         let frame = self.frame_data[frame_in_flight].clone();
         let ctx = Context::get();
@@ -147,116 +161,175 @@ impl RenderGraph {
                 .begin_command_buffer(frame.cmd, &begin_info)
                 .unwrap()
         };
-        let swapchain_image_index = self.swapchain.next_image(frame_in_flight);
+
+        self.swapchain_image_index = self.swapchain.next_image(frame_in_flight);
+    }
+
+    //TODO Error Handeling
+    pub fn draw_frame(&mut self, root_node: NodeHandle) {
+        let execution_order = if self.graph.len() > 2 {
+            log::error!("TODOOOOO");
+            self.bake(root_node).unwrap()
+        } else {
+            (0..self.graph.len()).collect::<Vec<_>>()
+        };
+        let frame_in_flight = self.frame_number as usize % FRAMES_IN_FLIGHT;
+        let frame = self.frame_data[frame_in_flight].clone();
+        let ctx = Context::get();
+        // println!("ImportedBuffer: {:#?}, ImportedImages: {:#?}, Buffers: {:#?}, Images: {:#?}", self.descriptor_handles[0], self.descriptor_handles[1], self.descriptor_handles[2], self.descriptor_handles[3]);
+
         BindlessDescriptorHeap::get().bind(&frame.cmd).unwrap();
 
-        self.write_bindings(swapchain_image_index).unwrap();
+        self.write_bindings().unwrap();
 
-        for (i, pass) in self.execution_order.iter().enumerate() {
-            let pass = &self.graph[*pass];
-            let mut image_barriers: HashMap<ResourceHandle, vk::ImageMemoryBarrier2> =
-                HashMap::new();
-            let mut buffer_barriers: HashMap<ResourceHandle, vk::BufferMemoryBarrier2> =
-                HashMap::new();
+        for (i, pass_index) in execution_order.iter().enumerate() {
+            let pass = &self.graph[*pass_index];
+            let mut image_barriers = Vec::new();
+            let mut buffer_barriers = Vec::new();
 
-            for read in &pass.reads {
-                if read.output_of == IMPORTED {
-                    continue;
-                }
-                if let Some(image) = self.image_handle(read.resource, swapchain_image_index) {
-                    image_barriers.insert(
-                        read.resource,
-                        image.memory_barrier(
-                            self.graph[read.output_of].writes[read.output_index]
-                                .layout
-                                .unwrap(),
-                            read.layout.unwrap(),
-                        ),
-                    );
-                }
-                if let Some(buffer) = self.buffer_handle(read.resource) {
-                    buffer_barriers.insert(
-                        read.resource,
-                        vk::BufferMemoryBarrier2::default()
-                            .buffer(buffer.buffer)
-                            .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
-                            .src_stage_mask(read.get_parrent(&self).execution.get_stages())
+            for edge in &pass.edges {
+                if let Some(image) = self.image_handle(edge.resource) {
+                    image_barriers.push(if let Some(origin) = edge.origin {
+                        let last_edge = self.graph[origin]
+                            .edges
+                            .iter()
+                            .find(|e| e.resource == edge.resource)
+                            .unwrap();
+                        vk::ImageMemoryBarrier2::default()
+                            .src_stage_mask(self.graph[origin].execution.get_stages())
                             .dst_stage_mask(pass.execution.get_stages())
-                            .dst_access_mask(vk::AccessFlags2::SHADER_READ)
+                            .src_access_mask(last_edge.edge_type.access_flags())
+                            .dst_access_mask(edge.edge_type.access_flags())
+                            .old_layout(last_edge.layout.unwrap())
+                            .new_layout(edge.layout.unwrap())
+                            .image(image.image)
+                            .subresource_range(image.subresource_range())
+                    } else {
+                        vk::ImageMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::empty())
+                            .dst_stage_mask(pass.execution.get_stages())
+                            .src_access_mask(vk::AccessFlags2::empty())
+                            .dst_access_mask(edge.edge_type.access_flags())
+                            .old_layout(vk::ImageLayout::UNDEFINED)
+                            .new_layout(edge.layout.unwrap())
+                            .image(image.image)
+                            .subresource_range(image.subresource_range())
+                    });
+                }
+                if let Some(buffer) = self.buffer_handle(edge.resource) {
+                    buffer_barriers.push(if let Some(origin) = edge.origin {
+                        let last_edge = self.graph[origin]
+                            .edges
+                            .iter()
+                            .find(|e| e.resource == edge.resource)
+                            .unwrap();
+                        vk::BufferMemoryBarrier2::default()
+                            .src_stage_mask(self.graph[origin].execution.get_stages())
+                            .dst_stage_mask(pass.execution.get_stages())
+                            .src_access_mask(last_edge.edge_type.access_flags())
+                            .dst_access_mask(edge.edge_type.access_flags())
+                            .buffer(buffer.buffer)
                             .offset(0)
-                            .size(vk::WHOLE_SIZE),
-                    );
+                            .size(vk::WHOLE_SIZE)
+                    } else {
+                        vk::BufferMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::empty())
+                            .dst_stage_mask(pass.execution.get_stages())
+                            .src_access_mask(vk::AccessFlags2::empty())
+                            .dst_access_mask(edge.edge_type.access_flags())
+                            .buffer(buffer.buffer)
+                            .offset(0)
+                            .size(vk::WHOLE_SIZE)
+                    });
                 }
             }
-
-            for writ in &pass.writes {
-                if let Some(image) = self.image_handle(writ.resource, swapchain_image_index) {
-                    image_barriers.insert(
-                        writ.resource,
-                        image.memory_barrier(vk::ImageLayout::UNDEFINED, writ.layout.unwrap()),
-                    );
-                }
-                if let Some(buffer) = self.buffer_handle(writ.resource) {
-                    buffer_barriers.insert(
-                        writ.resource,
-                        vk::BufferMemoryBarrier2::default()
-                            .buffer(buffer.buffer)
-                            .src_access_mask(
-                                vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
-                            )
-                            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                            .dst_stage_mask(pass.execution.get_stages())
-                            .dst_access_mask(vk::AccessFlags2::SHADER_WRITE)
-                            .offset(0)
-                            .size(vk::WHOLE_SIZE),
-                    );
-                }
-            }
-
+            // println!("{:#?}", image_barriers);
             let ctx = Context::get();
             unsafe {
                 ctx.device.cmd_pipeline_barrier2(
                     frame.cmd,
                     &vk::DependencyInfo::default()
                         .dependency_flags(vk::DependencyFlags::BY_REGION)
-                        .buffer_memory_barriers(
-                            buffer_barriers.into_values().collect::<Vec<_>>().as_slice(),
-                        )
-                        .image_memory_barriers(
-                            image_barriers.into_values().collect::<Vec<_>>().as_slice(),
-                        ),
+                        .buffer_memory_barriers(buffer_barriers.as_slice())
+                        .image_memory_barriers(image_barriers.as_slice()),
                 )
             };
 
             unsafe {
+                let mut constants = [0u8; 16];
+                constants[0..4].copy_from_slice(
+                    &pass
+                        .constants
+                        .as_ref()
+                        .and_then(|constant| {
+                            self.constants_cache
+                                .iter()
+                                .find(|c| c.0 == *constant)
+                                .and_then(|c| Some(c.1 as u32))
+                        })
+                        .unwrap_or(0)
+                        .to_ne_bytes(),
+                );
+
+                constants[4..8].copy_from_slice(
+                    &if pass.bindings().count() == 0 {
+                        0
+                    } else {
+                        self.graph[..*pass_index]
+                            .iter()
+                            .fold(0, |acc, e| acc + e.bindings().count())
+                            as u32
+                    }
+                    .to_ne_bytes(),
+                );
+                constants[8..12]
+                    .copy_from_slice(&(self.descriptor_buffer.index() as u32).to_ne_bytes());
+                constants[12..16]
+                    .copy_from_slice(&(self.constants_buffer.index() as u32).to_ne_bytes());
+
                 ctx.device.cmd_push_constants(
                     frame.cmd,
                     BindlessDescriptorHeap::get().layout,
                     vk::ShaderStageFlags::ALL,
                     0,
-                    &self.descriptor_handles[pass.descriptor_buffer.descriptor()]
-                    [pass.descriptor_buffer.index()].to_bytes(),
+                    &constants,
                 )
             };
-            pass.execution.execute(&frame.cmd).unwrap();
-            unsafe {
-                let barrier = [self.swapchain.images[swapchain_image_index]
-                    .memory_barrier(vk::ImageLayout::GENERAL, vk::ImageLayout::PRESENT_SRC_KHR)];
-                let dependency_info = vk::DependencyInfo::default().image_memory_barriers(&barrier);
-                ctx.device
-                    .cmd_pipeline_barrier2(frame.cmd, &dependency_info);
-            }
+            pass.execution
+                .execute(&frame.cmd, self, &self.graph[*pass_index].edges)
+                .unwrap();
+        }
+
+        let mut last_edge = None;
+        let last_node = self
+            .graph
+            .iter()
+            .find(|n| {
+                let res = n.edges.iter().find(|e| e.resource == self.get_swapchain());
+                last_edge = res;
+                res.is_some()
+            })
+            .expect("No writes to SWAPCHAIN found");
+        let end_stage = last_node.execution.get_stages();
+        let last_edge = last_edge.unwrap();
+
+        unsafe {
+            let swapchain_image = self.image_handle(self.get_swapchain()).unwrap();
+            let barrier = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(end_stage)
+                .dst_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                .src_access_mask(last_edge.edge_type.access_flags())
+                .dst_access_mask(vk::AccessFlags2::MEMORY_READ)
+                .old_layout(last_edge.layout.unwrap())
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .image(swapchain_image.image)
+                .subresource_range(swapchain_image.subresource_range())];
+            let dependency_info = vk::DependencyInfo::default().image_memory_barriers(&barrier);
+            ctx.device
+                .cmd_pipeline_barrier2(frame.cmd, &dependency_info);
         }
 
         unsafe { ctx.device.end_command_buffer(frame.cmd).unwrap() };
-
-        let end_stage = self
-            .graph
-            .iter()
-            .find(|n| n.writes.iter().find(|e| e.resource == SWPACHAIN).is_some())
-            .expect("No writes to SWAPCHAIN found")
-            .execution
-            .get_stages();
 
         let wait_semaphores = [vk::SemaphoreSubmitInfo::default()
             .semaphore(self.swapchain.frame_resources[frame_in_flight].image_availible_semaphore)
@@ -284,14 +357,13 @@ impl RenderGraph {
             .command_buffer_infos(&command_buffers)
             .signal_semaphore_infos(&signal_semaphores)
             .wait_semaphore_infos(&wait_semaphores);
-
         unsafe {
             ctx.device
                 .queue_submit2(ctx.graphics_queue, &[submit], vk::Fence::null())
                 .unwrap()
         };
         self.swapchain
-            .present(frame_in_flight, swapchain_image_index);
+            .present(frame_in_flight, self.swapchain_image_index);
 
         self.frame_number += 1;
     }

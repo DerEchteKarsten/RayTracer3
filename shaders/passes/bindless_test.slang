@@ -1,8 +1,9 @@
 #include "bindless.slang"
-#include "datatypes.slang"
+#include "random.slang"
 
 struct Bindings{
-    UniformBuffer<GConst> constants;
+    Texture1 depth;
+    Texture4 color;
     Image4 out;
 }
 
@@ -10,9 +11,12 @@ struct Bindings{
 [shader("compute")]
 [numthreads(8,8,1)]
 void main(uint3 threadId : SV_DispatchThreadID) {
-    let bindings = loadBindings<Bindings>();
+    var bindings = loadBindings<Bindings>();
+    // var rng = RandomSamplerState(threadId.xy, 0);
 
-    printf("%i", bindings.constants.value.frame_index);
+    // if(all(threadId.xy == 0)) {
+    //     printf("depth: %i, color: %i, out: %i \n", bindings.depth.handle.index, bindings.color.handle.index, bindings.out.handle.index);
+    // }
 
-    bindings.out.Store(threadId.xy, float4(1.0, 1.0, 1.0, 1.0));
+    bindings.out[threadId.xy] = bindings.color[threadId.xy];
 }

@@ -3,10 +3,7 @@ use ash::{khr, vk, Device, Instance};
 
 use crate::WINDOW_SIZE;
 
-use super::{
-    utils::{Image, ImageResource},
-    Context,
-};
+use super::{image::Image, Context};
 
 pub(crate) const FRAMES_IN_FLIGHT: usize = 3;
 
@@ -21,7 +18,7 @@ pub struct Swapchain {
     pub format: vk::Format,
     pub color_space: vk::ColorSpaceKHR,
     pub present_mode: vk::PresentModeKHR,
-    pub images: Vec<ImageResource>,
+    pub images: Vec<Image>,
     pub frame_resources: [FrameResources; FRAMES_IN_FLIGHT],
 }
 
@@ -127,14 +124,13 @@ impl Swapchain {
 
         let images = images
             .into_iter()
-            .map(|i| {
-                Image {
-                    image: i,
-                    format: format.format,
-                    extent,
-                    allocation: None,
-                }
-                .new_resource(&ctx.device, extent)
+            .map(|i| Image {
+                usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                image: i,
+                format: format.format,
+                extent,
+                view: Image::view(&ctx.device, extent, i, format.format),
+                allocation: None,
             })
             .collect::<Vec<_>>();
 

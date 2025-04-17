@@ -1,6 +1,9 @@
 #![feature(let_chains)]
 #![feature(generic_const_exprs)]
+#![feature(substr_range)]
+#![feature(box_as_ptr)]
 #![feature(int_roundings)]
+#![feature(rustc_private)]
 pub mod assets;
 pub mod backend;
 pub mod imgui;
@@ -14,18 +17,17 @@ use backend::{
     bindless::BindlessDescriptorHeap,
     pipeline_cache::PipelineCache,
     render_graph::{
-        build::{ComputePass, DispatchSize, ImageSize, LaunchSize, RayTracingPass},
-        RenderGraph, IMPORTED, SWPACHAIN,
+        build::{ComputePass, DispatchSize, ImageSize, RasterPass, RayTracingPass, WorkSize2D},
+        RenderGraph, IMPORTED,
     },
     vulkan::{
         self,
         raytracing::{self, RayTracingContext},
         swapchain::Swapchain,
-        utils::{create_sampler, Buffer, Image, ImageResource, SamplerInfo},
         Context,
     },
 };
-use glam::{vec3, IVec2, Mat4};
+use glam::{vec3, IVec2, Mat4, Vec2};
 use gpu_allocator::MemoryLocation;
 use imgui::ImGui;
 use scene::camera::{Camera, Controls};
@@ -42,33 +44,12 @@ const WINDOW_SIZE: IVec2 = IVec2::new(1920, 1088);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-pub struct PlanarViewConstants {
-    pub mat_world_to_view: glam::Mat4,
-    pub mat_view_to_clip: glam::Mat4,
-    pub mat_world_to_clip: glam::Mat4,
-    pub mat_clip_to_view: glam::Mat4,
-    pub mat_view_to_world: glam::Mat4,
-    pub mat_clip_to_world: glam::Mat4,
-
-    pub viewport_origin: glam::Vec2,
-    pub viewport_size: glam::Vec2,
-
-    pub viewport_size_inv: glam::Vec2,
-    pub pixel_offset: glam::Vec2,
-
-    pub clip_to_window_scale: glam::Vec2,
-    pub clip_to_window_bias: glam::Vec2,
-
-    pub window_to_clip_scale: glam::Vec2,
-    pub window_to_clip_bias: glam::Vec2,
-
-    pub camera_direction_or_position: glam::Vec4,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
 struct GConst {
-    pub planar_view_constants: PlanarViewConstants,
+    pub proj: glam::Mat4,
+    pub view: glam::Mat4,
+    pub proj_inverse: glam::Mat4,
+    pub view_inverse: glam::Mat4,
+    pub window_size: Vec2,
     pub frame: u32,
     pub blendfactor: f32,
     pub bounces: u32,
@@ -79,8 +60,8 @@ struct GConst {
 }
 
 fn main() {
-    let model_thread = std::thread::spawn(|| gltf::load_file("./assets/box.glb").unwrap());
-    let image_thread = std::thread::spawn(|| image::open("./assets/skybox2.exr").unwrap());
+    // let model_thread = std::thread::spawn(|| gltf::load_file("./assets/box.glb").unwrap());
+    // let image_thread = std::thread::spawn(|| image::open("./assets/skybox2.exr").unwrap());
 
     SimpleLogger::new()
         .with_level(log::LevelFilter::Debug)
@@ -98,68 +79,52 @@ fn main() {
         .unwrap();
 
     Context::init(&window, &window).unwrap();
-    RayTracingContext::init();
-
-    let model = model_thread.join().unwrap();
-    let model = Model::from_gltf(model).unwrap();
+    // RayTracingContext::init();
     BindlessDescriptorHeap::init();
     PipelineCache::init();
 
-    let image = image_thread.join().unwrap();
-    let skybox = ImageResource::new_from_data(image, vk::Format::R32G32B32A32_SFLOAT).unwrap();
+    // let model = model_thread.join().unwrap();
+    // let model = Model::from_gltf(model).unwrap();
+    // let image = image_thread.join().unwrap();
+    // let skybox = Image::new_from_data(image, vk::Format::R32G32B32A32_SFLOAT).unwrap();
 
-    let sampler_info = SamplerInfo {
-        mag_filter: vk::Filter::LINEAR,
-        min_filter: vk::Filter::LINEAR,
-        address_mode_u: vk::SamplerAddressMode::CLAMP_TO_EDGE,
-        address_mode_v: vk::SamplerAddressMode::CLAMP_TO_EDGE,
-        address_mode_w: vk::SamplerAddressMode::CLAMP_TO_EDGE,
-        max_anisotropy: 1.0,
-        border_color: vk::BorderColor::FLOAT_OPAQUE_BLACK,
-        compare_op: vk::CompareOp::NEVER,
-        ..Default::default()
-    };
+    // let model_mat = Mat4::IDENTITY;
+    // let tlas = {
+    //     let instaces = &[model.instance(model_mat)];
 
-    let model_mat = Mat4::IDENTITY;
-    let tlas = {
-        let instaces = &[model.instance(model_mat)];
+    //     let instance_buffer = Buffer::from_data(
+    //         vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+    //             | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+    //         instaces,
+    //     )
+    //     .unwrap();
 
-        let instance_buffer = Buffer::from_data(
-            vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
-            instaces,
-        )
-        .unwrap();
+    //     let as_struct_geo = vk::AccelerationStructureGeometryKHR::default()
+    //         .geometry_type(vk::GeometryTypeKHR::INSTANCES)
+    //         .flags(vk::GeometryFlagsKHR::OPAQUE)
+    //         .geometry(vk::AccelerationStructureGeometryDataKHR {
+    //             instances: vk::AccelerationStructureGeometryInstancesDataKHR::default()
+    //                 .array_of_pointers(false)
+    //                 .data(vk::DeviceOrHostAddressConstKHR {
+    //                     device_address: instance_buffer.address,
+    //                 }),
+    //         });
 
-        let as_struct_geo = vk::AccelerationStructureGeometryKHR::default()
-            .geometry_type(vk::GeometryTypeKHR::INSTANCES)
-            .flags(vk::GeometryFlagsKHR::OPAQUE)
-            .geometry(vk::AccelerationStructureGeometryDataKHR {
-                instances: vk::AccelerationStructureGeometryInstancesDataKHR::default()
-                    .array_of_pointers(false)
-                    .data(vk::DeviceOrHostAddressConstKHR {
-                        device_address: instance_buffer.address,
-                    }),
-            });
+    //     let as_ranges = vk::AccelerationStructureBuildRangeInfoKHR::default()
+    //         .first_vertex(0)
+    //         .primitive_count(instaces.len() as _)
+    //         .primitive_offset(0)
+    //         .transform_offset(0);
 
-        let as_ranges = vk::AccelerationStructureBuildRangeInfoKHR::default()
-            .first_vertex(0)
-            .primitive_count(instaces.len() as _)
-            .primitive_offset(0)
-            .transform_offset(0);
-
-        RayTracingContext::get()
-            .create_acceleration_structure(
-                vk::AccelerationStructureTypeKHR::TOP_LEVEL,
-                &[as_struct_geo],
-                &[as_ranges],
-                &[1],
-            )
-            .unwrap()
-    };
-
-    let mut imgui = ImGui::new(&window);
-    let mut rg = RenderGraph::new();
+    //     RayTracingContext::get()
+    //         .create_acceleration_structure(
+    //             vk::AccelerationStructureTypeKHR::TOP_LEVEL,
+    //             &[as_struct_geo],
+    //             &[as_ranges],
+    //             &[1],
+    //         )
+    //         .unwrap()
+    // };
 
     // let vertecies = rg.import_buffer(&model.vertex_buffer.handle());
     // let tlas = rg.import_tlas(&tlas);
@@ -212,9 +177,9 @@ fn main() {
     };
 
     let mut camera = Camera::new(
-        vec3(0.0, 0.0, 10.0),
+        vec3(0.0, 0.0, 0.0),
         vec3(0.0, 0.0, 1.0),
-        65.0,
+        65.0_f32.to_radians(),
         WINDOW_SIZE.x as f32 / WINDOW_SIZE.y as f32,
         0.1,
         1000.0,
@@ -231,22 +196,24 @@ fn main() {
                 1.0 / WINDOW_SIZE.y as f32,
                 WINDOW_SIZE.y as f32 / (WINDOW_SIZE.x as f32 * WINDOW_SIZE.x as f32),
             ),
-        );
+    );
 
-    let tlas = rg.import_tlas(&tlas);
-    let vertecies = rg.import_buffer(&model.vertex_buffer.handle());
-    let indicies = rg.import_buffer(&model.index_buffer.handle());
+    let mut imgui = ImGui::new(&window);
+    let mut rg = RenderGraph::new();
 
-    let gbuffer = RayTracingPass::new(&mut rg)
-        .shader("gbuffer")
-        .constants(&gconst)
-        .read(IMPORTED, tlas)
-        .read(IMPORTED, vertecies)
-        .read(IMPORTED, indicies)
-        .write(SWPACHAIN)
-        .launch(LaunchSize::FullScreen);
-
-    rg.bake().unwrap();
+    // let tlas = rg.import_tlas(&tlas);
+    // let vertecies = rg.import_buffer(&model.vertex_buffer.handle());
+    // let indicies = rg.import_buffer(&model.index_buffer.handle());
+    let depth = rg.image(
+        ImageSize::FullScreen,
+        ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | ImageUsageFlags::SAMPLED,
+        Format::D32_SFLOAT,
+    );
+    let color = rg.image(
+        ImageSize::FullScreen,
+        ImageUsageFlags::COLOR_ATTACHMENT | ImageUsageFlags::SAMPLED,
+        Format::R8G8B8A8_SRGB,
+    );
 
     let mut frame_time = Duration::default();
     let mut last_time = Instant::now();
@@ -283,13 +250,37 @@ fn main() {
                     WindowEvent::RedrawRequested => {
                         let new_cam = camera.update(&controles, frame_time);
                         camera = new_cam;
-                        gconst.planar_view_constants = camera.planar_view_constants();
+                        gconst.proj = camera.projection_matrix();
+                        gconst.proj_inverse = camera.projection_matrix().inverse();
+                        gconst.view = camera.view_matrix().inverse();
+                        gconst.view_inverse = camera.view_matrix().inverse();
+                        gconst.window_size = Vec2::new(WINDOW_SIZE.x as f32, WINDOW_SIZE.y as f32);
                         gconst.frame = rg.frame_number.try_into().unwrap_or(0);
                         gconst.mouse = [
                             controles.cursor_position[0] as u32,
                             controles.cursor_position[1] as u32,
                         ];
-                        rg.draw();
+                        rg.begin_frame();
+
+                        let swapchain = rg.get_swapchain();
+                        let test2 = RasterPass::new(&mut rg)
+                            .fragment_shader("bindless_test2")
+                            .mesh_shader("bindless_test2")
+                            .fragment_entry("fragment")
+                            .mesh_entry("vertex")
+                            .constants(&gconst)
+                            .depth_attachment(IMPORTED, depth)
+                            .color_attachment(IMPORTED, swapchain)
+                            .render_area(WorkSize2D::FullScreen)
+                            .draw(DispatchSize::X(1));
+
+                        // let test = ComputePass::new(&mut rg)
+                        //     .shader("bindless_test")
+                        //     .read(test2, depth)
+                        //     .read(test2, color)
+                        //     .write(IMPORTED, swapchain)
+                        //     .dispatch(DispatchSize::FullScreen);
+                        rg.draw_frame(test2);
                         // let ui = imgui.context.frame();
                         // ui.window("Constants Editor")
                         //     .size([300.0, WINDOW_SIZE.y as f32], Condition::FirstUseEver)

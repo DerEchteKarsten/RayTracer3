@@ -6,10 +6,11 @@ use glam::UVec2;
 
 use crate::raytracing::AccelerationStructure;
 
-use super::{
-    vulkan::raytracing::RayTracingContext,
-    vulkan::utils::{Buffer, BufferHandle, Image, ImageHandle, ImageResource},
-    vulkan::Context,
+use super::vulkan::{
+    buffer::{BufferHandle, BufferType},
+    image::{ImageHandle, ImageType},
+    raytracing::RayTracingContext,
+    Context,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -18,15 +19,20 @@ pub(crate) struct ImmutableSampler(u32);
 
 impl ImmutableSampler {
     pub fn new(mag_filter: vk::Filter, min_filter: vk::Filter) -> Result<Self> {
-        if mag_filter == vk::Filter::CUBIC_EXT || mag_filter == vk::Filter::CUBIC_IMG
-            || min_filter == vk::Filter::CUBIC_EXT || min_filter == vk::Filter::CUBIC_IMG {
+        if mag_filter == vk::Filter::CUBIC_EXT
+            || mag_filter == vk::Filter::CUBIC_IMG
+            || min_filter == vk::Filter::CUBIC_EXT
+            || min_filter == vk::Filter::CUBIC_IMG
+        {
             Err(anyhow::Error::msg("Unsuported Sampler"))
-        }else {
-            Ok(Self((mag_filter == vk::Filter::NEAREST) as u32 | (min_filter == vk::Filter::NEAREST) as u32))
+        } else {
+            Ok(Self(
+                (mag_filter == vk::Filter::NEAREST) as u32
+                    | (min_filter == vk::Filter::NEAREST) as u32,
+            ))
         }
     }
 }
-
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 #[repr(C)]
@@ -49,10 +55,10 @@ pub enum RenderResourceTag {
 impl RenderResourceTag {
     fn table(&self) -> BindlessTableType {
         match self {
-            Self::AccelerationStructure => BindlessTableType::AccelerationStructures,
             Self::Buffer => BindlessTableType::Buffers,
-            Self::Image => BindlessTableType::Textures,
+            Self::Image => BindlessTableType::Images,
             Self::Texture => BindlessTableType::Textures,
+            Self::AccelerationStructure => BindlessTableType::AccelerationStructures,
         }
     }
 }
@@ -66,8 +72,8 @@ impl DescriptorResourceHandle {
         self
     }
 
-    fn index(&self) -> u32 {
-        self.0// self.0 & 0xffffff
+    pub fn index(&self) -> u32 {
+        self.0 // self.0 & 0xffffff
     }
 
     pub fn to_bytes(&self) -> [u8; 4] {
@@ -140,34 +146,29 @@ impl BindlessTableType {
                 ctx.physical_device.limits.max_descriptor_set_sampled_images
             }
             BindlessTableType::AccelerationStructures => {
-                raytracing_ctx
-                    .acceleration_structure_properties
-                    .max_descriptor_set_acceleration_structures
+                if let Some(r) = raytracing_ctx {
+                    r.acceleration_structure_properties
+                        .max_descriptor_set_acceleration_structures
+                } else {
+                    0
+                }
             }
         }
+        .min(100000)
     }
 
     pub fn descriptor_pool_sizes(immutable_sampler_count: u32) -> Vec<vk::DescriptorPoolSize> {
-        let mut type_histogram = std::collections::HashMap::new();
-
-        for table in Self::all_tables().iter() {
-            type_histogram
-                .entry(table.to_vk())
-                .and_modify(|v| *v += table.table_size())
-                .or_insert_with(|| table.table_size());
-        }
-
-        type_histogram
-            .entry(Self::Textures.to_vk())
-            .and_modify(|v| *v += immutable_sampler_count);
-
-        type_histogram
+        Self::all_tables()
             .iter()
-            .map(|(ty, descriptor_count)| vk::DescriptorPoolSize {
-                ty: *ty,
-                descriptor_count: *descriptor_count,
+            .map(|table| vk::DescriptorPoolSize {
+                ty: table.to_vk(),
+                descriptor_count: table.table_size(),
             })
-            .collect::<Vec<vk::DescriptorPoolSize>>()
+            .chain(std::iter::once(vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::SAMPLER,
+                descriptor_count: immutable_sampler_count,
+            }))
+            .collect::<Vec<_>>()
     }
 }
 
@@ -189,12 +190,12 @@ impl BindlessDescriptorHeap {
         )
     }
 
-    pub fn allocate_buffer_handle(&mut self, buffer: &BufferHandle) -> DescriptorResourceHandle {
+    pub fn allocate_buffer_handle(&mut self, buffer: &impl BufferType) -> DescriptorResourceHandle {
         let ctx = Context::get();
         let handle = Self::fetch_available_descriptor(self, RenderResourceTag::Buffer);
 
         let buffer_info = [vk::DescriptorBufferInfo {
-            buffer: buffer.buffer,
+            buffer: buffer.to_vk(),
             offset: 0,
             range: vk::WHOLE_SIZE,
         }];
@@ -215,14 +216,14 @@ impl BindlessDescriptorHeap {
         handle
     }
 
-    pub fn allocate_image_handle(&mut self, image: &ImageHandle) -> DescriptorResourceHandle {
+    pub fn allocate_image_handle(&mut self, image: &impl ImageType) -> DescriptorResourceHandle {
         let ctx = Context::get();
         let handle = Self::fetch_available_descriptor(self, RenderResourceTag::Image);
 
         let image_info = vk::DescriptorImageInfo {
             image_layout: vk::ImageLayout::GENERAL,
             sampler: vk::Sampler::null(),
-            image_view: image.view,
+            image_view: image.get_view(),
         };
 
         let write = [vk::WriteDescriptorSet {
@@ -241,19 +242,19 @@ impl BindlessDescriptorHeap {
         handle
     }
 
-    pub fn allocate_texture_handle(&mut self, image: &ImageHandle) -> DescriptorResourceHandle {
+    pub fn allocate_texture_handle(&mut self, image: &impl ImageType) -> DescriptorResourceHandle {
         let ctx = Context::get();
-        let handle = Self::fetch_available_descriptor(self, RenderResourceTag::Image);
+        let handle = Self::fetch_available_descriptor(self, RenderResourceTag::Texture);
 
         let image_info = vk::DescriptorImageInfo {
             image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             sampler: vk::Sampler::null(),
-            image_view: image.view,
+            image_view: image.get_view(),
         };
 
         let write = [vk::WriteDescriptorSet {
             dst_set: self.sets[BindlessTableType::Textures.set_index()],
-            dst_binding: 0,
+            dst_binding: 4,
             descriptor_count: 1,
             dst_array_element: handle.index(),
             descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
@@ -272,6 +273,9 @@ impl BindlessDescriptorHeap {
         tlas: &AccelerationStructure,
     ) -> DescriptorResourceHandle {
         let ctx = Context::get();
+        if RayTracingContext::get().is_some() {
+            panic!("No Raytracing Context initilized");
+        }
         let handle =
             Self::fetch_available_descriptor(self, RenderResourceTag::AccelerationStructure);
 
@@ -306,21 +310,34 @@ impl BindlessDescriptorHeap {
 
     pub(crate) fn new() -> Self {
         let ctx = Context::get();
-        let immutable_samplers: [vk::Sampler; 4] = (0..3).into_iter().map(|i: i32| {
-            let create_info = vk::SamplerCreateInfo {
-                min_filter: if i % 2 == 0 {vk::Filter::NEAREST} else {vk::Filter::LINEAR},
-                mag_filter: if i.div_floor(2) == 0 {vk::Filter::NEAREST} else {vk::Filter::LINEAR},
-                ..Default::default()
-            };
-            unsafe { ctx.device.create_sampler(&create_info, None).unwrap() }
-        }).collect::<Vec<vk::Sampler>>().try_into().unwrap();
+        let immutable_samplers: [vk::Sampler; 4] = (0..4)
+            .into_iter()
+            .map(|i: i32| {
+                let create_info = vk::SamplerCreateInfo {
+                    min_filter: if i % 2 == 0 {
+                        vk::Filter::NEAREST
+                    } else {
+                        vk::Filter::LINEAR
+                    },
+                    mag_filter: if i.div_floor(2) == 0 {
+                        vk::Filter::NEAREST
+                    } else {
+                        vk::Filter::LINEAR
+                    },
+                    ..Default::default()
+                };
+                unsafe { ctx.device.create_sampler(&create_info, None).unwrap() }
+            })
+            .collect::<Vec<vk::Sampler>>()
+            .try_into()
+            .unwrap();
 
         let descriptor_sizes =
             BindlessTableType::descriptor_pool_sizes(immutable_samplers.len() as u32);
 
         let descriptor_pool_info = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(&descriptor_sizes)
-            .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND)
+            .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND_EXT)
             .max_sets(4);
 
         let descriptor_pool = unsafe {
@@ -446,7 +463,7 @@ impl BindlessDescriptorHeap {
                     .unwrap();
             });
 
-        let num_push_constants = 2;
+        let num_push_constants = 4;
         let num_push_constants_sized = std::mem::size_of::<u32>() as u32 * num_push_constants;
 
         let push_constant_range = vk::PushConstantRange {
@@ -481,16 +498,18 @@ impl BindlessDescriptorHeap {
                 &[],
             )
         };
-        unsafe {
-            ctx.device.cmd_bind_descriptor_sets(
-                *cmd,
-                vk::PipelineBindPoint::RAY_TRACING_KHR,
-                self.layout,
-                0,
-                &self.sets,
-                &[],
-            )
-        };
+        if RayTracingContext::get().is_some() {
+            unsafe {
+                ctx.device.cmd_bind_descriptor_sets(
+                    *cmd,
+                    vk::PipelineBindPoint::RAY_TRACING_KHR,
+                    self.layout,
+                    0,
+                    &self.sets,
+                    &[],
+                )
+            };
+        }
         unsafe {
             ctx.device.cmd_bind_descriptor_sets(
                 *cmd,

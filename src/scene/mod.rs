@@ -1,5 +1,3 @@
 pub mod camera;
 
-struct Scene {
-    
-}
+struct Scene {}

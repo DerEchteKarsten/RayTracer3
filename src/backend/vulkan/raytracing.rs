@@ -10,10 +10,7 @@ use log::debug;
 
 use crate::PipelineCache;
 
-use super::{
-    utils::{alinged_size, Buffer},
-    Context,
-};
+use super::{buffer::Buffer, sampler::alinged_size, Context};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RayTracingShaderGroupInfo {
@@ -22,6 +19,7 @@ pub struct RayTracingShaderGroupInfo {
     pub miss_shader_count: u32,
     pub hit_shader_count: u32,
 }
+
 #[derive(Debug, Clone)]
 pub struct RayTracingShaderCreateInfo<'a> {
     pub source: &'a [(&'a str, &'a str, vk::ShaderStageFlags)],
@@ -49,11 +47,11 @@ pub struct RayTracingContext {
         vk::PhysicalDeviceAccelerationStructurePropertiesKHR<'static>,
     pub acceleration_structure_fn: acceleration_structure::Device,
 }
-static mut RAYTRACING_CONTEXT: MaybeUninit<RayTracingContext> = MaybeUninit::uninit();
+static mut RAYTRACING_CONTEXT: Option<RayTracingContext> = None;
 
 impl RayTracingContext {
-    pub fn get() -> &'static RayTracingContext {
-        unsafe { RAYTRACING_CONTEXT.assume_init_ref() }
+    pub fn get() -> Option<&'static RayTracingContext> {
+        unsafe { RAYTRACING_CONTEXT.as_ref() }
     }
 
     pub(crate) fn init() {
@@ -81,7 +79,7 @@ impl RayTracingContext {
             ash::khr::acceleration_structure::Device::new(&ctx.instance, &ctx.device);
 
         unsafe {
-            RAYTRACING_CONTEXT.write(Self {
+            RAYTRACING_CONTEXT = Some(Self {
                 pipeline_properties,
                 pipeline_fn,
                 acceleration_structure_properties,
@@ -274,7 +272,7 @@ pub struct ShaderBindingTable {
 
 impl ShaderBindingTable {
     pub fn new(pipeline: &vk::Pipeline, shaders: &RayTracingShaderGroupInfo) -> Result<Self> {
-        let ray_tracing = RayTracingContext::get();
+        let ray_tracing = RayTracingContext::get().unwrap();
         let desc = shaders;
 
         let handle_size = ray_tracing.pipeline_properties.shader_group_handle_size;

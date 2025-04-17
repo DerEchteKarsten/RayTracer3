@@ -1,8 +1,18 @@
 use std::mem::{size_of, size_of_val};
 
 use super::gltf::{self, Vertex};
-use crate::backend::{
-    bindless::{BindlessDescriptorHeap, DescriptorResourceHandle, ImmutableSampler}, vulkan::{raytracing::{AccelerationStructure, RayTracingContext}, utils::{Buffer, Image, ImageResource}, Context}
+use crate::{
+    backend::{
+        bindless::{BindlessDescriptorHeap, DescriptorResourceHandle, ImmutableSampler},
+        vulkan::{
+            raytracing::{AccelerationStructure, RayTracingContext},
+            Context,
+        },
+    },
+    vulkan::{
+        buffer::{Buffer, BufferType},
+        image::{Image, ImageType},
+    },
 };
 use anyhow::Result;
 use ash::vk::{self, Filter, Packed24_8};
@@ -25,8 +35,8 @@ pub struct GeometryInfo {
 
 pub struct Model {
     pub index_count: u32,
-    pub images: Vec<ImageResource>,
-    pub blas: AccelerationStructure,
+    pub images: Vec<Image>,
+    pub blas: Option<AccelerationStructure>,
     pub vertex_buffer: Buffer,
     pub index_buffer: Buffer,
     pub transform_buffer: Buffer,
@@ -67,7 +77,7 @@ impl Model {
                 vk::GeometryInstanceFlagsKHR::TRIANGLE_CULL_DISABLE_NV.as_raw() as _,
             ),
             acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
-                device_handle: self.blas.address,
+                device_handle: self.blas.as_ref().unwrap().address,
             },
         }
     }
@@ -183,11 +193,7 @@ impl Model {
 
         let vertices = model.vertices.as_slice();
         let indices = model.indices.as_slice();
-        for v in vertices {
-            if v.color != Vec4::new(1.0, 1.0, 1.0, 1.0) {
-                println!("{:?}", v);
-            }
-        }
+
         let transforms = model
             .nodes
             .iter()
@@ -230,7 +236,7 @@ impl Model {
 
             staging.copy_data_to_buffer(pixels)?;
 
-            let image = ImageResource::new_2d(
+            let image = Image::new_2d(
                 vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
                 MemoryLocation::GpuOnly,
                 vk::Format::R8G8B8A8_SRGB,
@@ -243,7 +249,6 @@ impl Model {
                     ctx.device.cmd_pipeline_barrier2(
                         *cmd,
                         &vk::DependencyInfo::default().image_memory_barriers(&[image
-                            .image
                             .memory_barrier(
                                 vk::ImageLayout::UNDEFINED,
                                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -251,13 +256,12 @@ impl Model {
                     )
                 };
 
-                staging.copy_to_image(cmd, &image.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+                staging.copy_to_image(cmd, &image, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
 
                 unsafe {
                     ctx.device.cmd_pipeline_barrier2(
                         *cmd,
                         &vk::DependencyInfo::default().image_memory_barriers(&[image
-                            .image
                             .memory_barrier(
                                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
@@ -272,7 +276,7 @@ impl Model {
         })?;
 
         if images.is_empty() {
-            let image = ImageResource::new_2d(
+            let image = Image::new_2d(
                 vk::ImageUsageFlags::SAMPLED,
                 MemoryLocation::GpuOnly,
                 vk::Format::R8G8B8A8_SRGB,
@@ -285,7 +289,6 @@ impl Model {
                     ctx.device.cmd_pipeline_barrier2(
                         *cmd,
                         &vk::DependencyInfo::default().image_memory_barriers(&[image
-                            .image
                             .memory_barrier(
                                 vk::ImageLayout::UNDEFINED,
                                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
@@ -297,7 +300,10 @@ impl Model {
             images.push(image);
         }
 
-        let descriptor_handels = images.iter().map(|e| {BindlessDescriptorHeap::get_mut().allocate_texture_handle(&e.handle())}).collect::<Vec<_>>();
+        let descriptor_handels = images
+            .iter()
+            .map(|e| BindlessDescriptorHeap::get_mut().allocate_texture_handle(&e.handle()))
+            .collect::<Vec<_>>();
 
         let vertex_buffer = Buffer::from_data(
             vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
@@ -350,10 +356,8 @@ impl Model {
             if emission[0] != 0.0 || emission[1] != 0.0 || emission[2] != 0.0 {
                 lights += primitive_count;
             }
-            let texture = model.textures[mesh
-            .material
-            .base_color_texture_index
-            .map_or(0, |i| i as _)];
+            let texture =
+                model.textures[mesh.material.base_color_texture_index.map_or(0, |i| i as _)];
             geometry_infos.push(GeometryInfo {
                 transform: Mat4::from_cols_array_2d(&node.transform),
                 color: mesh.material.base_color,
@@ -392,12 +396,17 @@ impl Model {
             geometry_infos.as_slice(),
         )?;
 
-        let blas = RayTracingContext::get().create_acceleration_structure(
-            vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
-            &as_geometries,
-            &as_ranges,
-            &max_primitive_counts,
-        )?;
+        let blas = RayTracingContext::get().and_then(|ctx| {
+            Some(
+                ctx.create_acceleration_structure(
+                    vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
+                    &as_geometries,
+                    &as_ranges,
+                    &max_primitive_counts,
+                )
+                .unwrap(),
+            )
+        });
 
         Ok(Self {
             index_count: indices.len() as u32,

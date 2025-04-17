@@ -6,12 +6,12 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
 };
 
-use crate::{PlanarViewConstants, WINDOW_SIZE};
+use crate::WINDOW_SIZE;
 
 const MOVE_SPEED: f32 = 30.0;
 const ANGLE_PER_POINT: f32 = 1.0;
 
-const UP: Vec3 = vec3(0.0, -1.0, 0.0);
+const UP: Vec3 = vec3(0.0, 1.0, 0.0);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Camera {
@@ -50,7 +50,7 @@ impl Camera {
         let new_direction = if controls.look_around {
             let side_rot = Quat::from_axis_angle(
                 side,
-                -controls.cursor_delta[1] * ANGLE_PER_POINT * delta_time,
+                controls.cursor_delta[1] * ANGLE_PER_POINT * delta_time,
             );
             let y_rot =
                 Quat::from_rotation_y(-controls.cursor_delta[0] * ANGLE_PER_POINT * delta_time);
@@ -65,10 +65,10 @@ impl Camera {
         let mut direction = Vec3::ZERO;
 
         if controls.go_forward {
-            direction -= new_direction;
+            direction += new_direction;
         }
         if controls.go_backward {
-            direction += new_direction;
+            direction -= new_direction;
         }
         if controls.strafe_right {
             direction += side;
@@ -97,63 +97,12 @@ impl Camera {
     }
 
     pub fn view_matrix(&self) -> Mat4 {
-        Mat4::look_at_rh(self.position, self.position + self.direction, UP)
+        Mat4::look_at_rh(self.position, self.position + self.direction, UP).inverse()
     }
 
     pub fn projection_matrix(&self) -> Mat4 {
-        perspective(
-            self.fov.to_radians(),
-            self.aspect_ratio,
-            self.z_near,
-            self.z_far,
-        )
+        Mat4::perspective_rh(self.fov, self.aspect_ratio, self.z_near, self.z_far)
     }
-    pub fn planar_view_constants(&self) -> PlanarViewConstants {
-        let window_size = glam::vec2(WINDOW_SIZE.x as f32, WINDOW_SIZE.y as f32);
-        let clip_to_window_scale = glam::vec2(0.5 * window_size.x, -0.5 * window_size.y);
-        let clip_to_window_bias = window_size * 0.5;
-        let window_to_clip_scale = 1.0 / clip_to_window_scale;
-
-        PlanarViewConstants {
-            mat_world_to_view: self.view_matrix(),
-            mat_view_to_clip: self.projection_matrix(),
-            mat_world_to_clip: self.projection_matrix() * self.view_matrix(),
-            mat_clip_to_view: self.projection_matrix().inverse(),
-            mat_view_to_world: self.view_matrix().inverse(),
-            mat_clip_to_world: self.projection_matrix().inverse() * self.view_matrix().inverse(),
-            viewport_origin: glam::vec2(0.0, 0.0),
-            viewport_size: window_size,
-            viewport_size_inv: 1.0 / window_size,
-
-            clip_to_window_scale,
-            clip_to_window_bias,
-
-            window_to_clip_scale,
-            window_to_clip_bias: -clip_to_window_bias * window_to_clip_scale,
-
-            camera_direction_or_position: glam::vec4(
-                self.position.x,
-                self.position.y,
-                self.position.z,
-                1.0,
-            ),
-            pixel_offset: glam::vec2(0.0, 0.0),
-        }
-    }
-}
-
-#[rustfmt::skip]
-pub fn perspective(fovy: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
-    
-    let y_scale = 1.0 / f32::tan(0.5 * fovy);
-    let x_scale = y_scale / aspect;
-    let z_scale = 1.0 / (far - near);
-    return Mat4::from_cols_array(&[
-                x_scale, 0.0, 0.0, 0.0,
-                0.0, y_scale, 0.0, 0.0,
-                0.0, 0.0, -(near + far) * z_scale, 1.0,
-                0.0, 0.0, -2.0 * near * far * z_scale, 0.0
-            ]);
 }
 
 #[derive(Debug, Clone, Copy)]

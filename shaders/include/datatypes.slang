@@ -20,32 +20,12 @@ struct GeometryInfo {
 	float roughness;
 };
 
-struct PlanarViewConstants
-{
-    float4x4 matWorldToView;
-    float4x4 matViewToClip;
-    float4x4 matWorldToClip;
-    float4x4 matClipToView;
-    float4x4 matViewToWorld;
-    float4x4 matClipToWorld;
-
-    float2 viewportOrigin;
-    float2 viewportSize;
-
-    float2 viewportSizeInv;
-    float2 pixelOffset;
-
-    float2 clipToWindowScale;
-    float2 clipToWindowBias;
-
-    float2 windowToClipScale;
-    float2 windowToClipBias;
-
-	float4 cameraDirectionOrPosition;
-};
-
 struct GConst {
-    PlanarViewConstants view;
+    column_major float4x4 proj;
+    column_major float4x4 view;
+    column_major float4x4 proj_inverse;
+    column_major float4x4 view_inverse;
+    float2 window_size;
     uint frame_index;
     float blendfactor;
     uint bounces;

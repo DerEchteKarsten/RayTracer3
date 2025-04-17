@@ -10,49 +10,43 @@ use winit::platform::x11;
 
 use crate::backend::bindless::{BindlessDescriptorHeap, DescriptorResourceHandle};
 use crate::backend::pipeline_cache::{
-    ComputePipelineHandle, PipelineCache, RayTracingPipelineHandle,
+    ComputePipelineHandle, PipelineCache, RasterPipelineHandle, RayTracingPipelineHandle,
 };
 use crate::raytracing::{RayTracingContext, RayTracingShaderCreateInfo, ShaderBindingTable};
-use crate::vulkan::utils::BufferHandle;
 use crate::vulkan::Context;
 
-use crate::backend::vulkan::utils::{Buffer, Image, ImageResource};
 use crate::WINDOW_SIZE;
 
 use derivative::Derivative;
 
 use super::{
-    Execution, Node, NodeEdge, NodeHandle, RenderGraph, ResourceHandle, ResourceMemoryType,
-    FRAMES_IN_FLIGHT, IMPORTED,
+    Constant, EdgeType, Execution, ExecutionTrait, Node, NodeEdge, NodeHandle, RenderGraph,
+    ResourceHandle, ResourceMemoryType, FRAMES_IN_FLIGHT, IMPORTED,
 };
 
-use std::ffi;
+use std::ffi::{self, c_void};
 
 pub struct NodeBuilder<'a, T>
 where
-    T: Execution + 'static,
+    T: ExecutionTrait + 'static,
 {
     rg: &'a mut RenderGraph,
     execution: MaybeUninit<T>,
-    reads: Vec<NodeEdge>,
-    writes: Vec<NodeEdge>,
-    handle: NodeHandle,
+    edges: Vec<NodeEdge>,
     constants: Option<*const ffi::c_void>,
     constants_size: usize,
 }
 
 impl<'b, T> NodeBuilder<'b, T>
 where
-    T: Execution + 'static,
+    T: ExecutionTrait + 'static,
+    Execution: From<T>,
 {
-    fn new<E: Execution + 'static>(rg: &'b mut RenderGraph) -> NodeBuilder<'b, E> {
-        let handle = rg.graph.len();
+    fn new<E: ExecutionTrait + 'static>(rg: &'b mut RenderGraph) -> NodeBuilder<'b, E> {
         NodeBuilder::<'b, E> {
             rg,
-            handle,
             execution: MaybeUninit::uninit(),
-            reads: Vec::new(),
-            writes: Vec::new(),
+            edges: Vec::new(),
             constants: None,
             constants_size: 0,
         }
@@ -64,89 +58,96 @@ where
         self
     }
 
-    pub fn read_array(mut self, output: NodeHandle, handle: ResourceHandle) -> Self {
-        self.reads.push(NodeEdge {
-            layout: Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-            output_of: output,
-            output_index: self.rg.graph[output]
-                .writes
+    pub fn read(mut self, origin: NodeHandle, handle: ResourceHandle) -> Self {
+        if origin != IMPORTED {
+            let prev = self.rg.graph[origin]
+                .edges
                 .iter()
-                .position(|e| e.resource == handle)
-                .unwrap(),
+                .find(|e| e.resource == handle)
+                .ok_or(Error::msg("Origin doesnt write to handle".to_owned()))
+                .unwrap();
+            if prev.edge_type == EdgeType::ShaderRead {
+                panic!("Origin contains handle but does not write to it")
+            }
+        }
+        let image_handle = self.rg.image_handle(handle);
+        self.edges.push(NodeEdge {
+            layout: image_handle.and_then(|image| {
+                Some(if image.usage.contains(vk::ImageUsageFlags::STORAGE) {
+                    vk::ImageLayout::GENERAL
+                } else {
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                })
+            }),
+            origin: if origin == IMPORTED {
+                None
+            } else {
+                Some(origin)
+            },
+            edge_type: EdgeType::ShaderRead,
             resource: handle,
         });
         self
     }
 
-    pub fn read(mut self, output: NodeHandle, handle: ResourceHandle) -> Self {
-        self.reads.push(NodeEdge {
-            layout: Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-            output_of: output,
-            output_index: self.rg.graph[output]
-                .writes
-                .iter()
-                .position(|e| e.resource == handle)
-                .unwrap(),
+    pub fn write(mut self, last_read: NodeHandle, handle: ResourceHandle) -> Self {
+        self.edges.push(NodeEdge {
+            layout: Some(vk::ImageLayout::GENERAL),
+            origin: if last_read == IMPORTED {
+                None
+            } else {
+                Some(last_read)
+            },
+            edge_type: EdgeType::ShaderWrite,
             resource: handle,
         });
         self
     }
 
-    pub fn write(mut self, handle: ResourceHandle) -> Self {
-        let output_index = self.writes.len();
-        self.writes.push(NodeEdge {
+    pub fn read_write(mut self, origin: NodeHandle, handle: ResourceHandle) -> Self {
+        self.edges.push(NodeEdge {
             layout: Some(vk::ImageLayout::GENERAL),
-            output_of: self.handle,
-            output_index,
-            resource: handle,
-        });
-        self
-    }
-
-    pub fn read_write(mut self, output: NodeHandle, handle: ResourceHandle) -> Self {
-        let output_index = self.writes.len();
-        self.reads.push(NodeEdge {
-            layout: Some(vk::ImageLayout::GENERAL),
-            output_of: output,
-            output_index: self.rg.graph[output]
-                .writes
-                .iter()
-                .position(|e| e.resource == handle)
-                .unwrap(),
-            resource: handle,
-        });
-        self.writes.push(NodeEdge {
-            layout: Some(vk::ImageLayout::GENERAL),
-            output_of: self.handle,
-            output_index,
+            origin: if origin == IMPORTED {
+                None
+            } else {
+                Some(origin)
+            },
+            edge_type: super::EdgeType::ShaderReadWrite,
             resource: handle,
         });
         self
     }
     fn build(self) -> NodeHandle {
-        let constants_buffer = if let Some(constants) = self.constants {
-            let handle = self.rg.internal_buffer(self.constants_size as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu);
-            let buffer = &self.rg.internal_buffers[handle.index()];
-            unsafe { buffer.allocation.mapped_ptr().unwrap().as_ptr().copy_from(constants, self.constants_size) };
-
-            Some(handle)
-        }else {
-            None
+        let node = Node {
+            edges: self.edges,
+            execution: Execution::from(unsafe { self.execution.assume_init() }),
+            constants: self.constants.and_then(|constants| {
+                let c = Constant {
+                    pointer: constants,
+                    size: self.constants_size,
+                };
+                if self
+                    .rg
+                    .constants_cache
+                    .iter()
+                    .find(|co| co.0 == c)
+                    .is_none()
+                {
+                    let offset = self
+                        .rg
+                        .constants_cache
+                        .last()
+                        .and_then(|l| Some(l.1 + l.0.size))
+                        .unwrap_or(0);
+                    self.rg.constants_cache.push((c.clone(), offset));
+                }
+                Some(c)
+            }),
         };
-        
-        let mut node = Node {
-            reads: self.reads,
-            writes: self.writes,
-            descriptor_buffer: ResourceHandle(0),
-            constants_buffer,
-            execution: Box::new(unsafe { self.execution.assume_init() }),
-            constants: self.constants,
-            constants_size: self.constants_size
-        };
 
-        node.descriptor_buffer = self.rg.internal_buffer((node.num_bindings() * size_of::<usize>()) as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu);
+        let handle = self.rg.graph.len();
         self.rg.graph.push(node);
-        self.handle
+        handle
     }
 }
 
@@ -169,7 +170,7 @@ impl ImageSize {
     }
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, PartialEq)]
 pub enum DispatchSize {
     #[default]
     FullScreen,
@@ -204,7 +205,7 @@ impl DispatchSize {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct ComputePass {
     pipeline: ComputePipelineHandle,
     dispatch: DispatchSize,
@@ -239,8 +240,13 @@ impl<'b> NodeBuilder<'b, ComputePass> {
     }
 }
 
-impl Execution for ComputePass {
-    fn execute(&self, cmd: &vk::CommandBuffer) -> Result<()> {
+impl ExecutionTrait for ComputePass {
+    fn execute(
+        &self,
+        cmd: &vk::CommandBuffer,
+        _rg: &RenderGraph,
+        _edges: &[NodeEdge],
+    ) -> Result<()> {
         let (x, y, z) = self.dispatch.size();
         self.pipeline.dispatch(cmd, x, y, z);
         Ok(())
@@ -250,8 +256,8 @@ impl Execution for ComputePass {
     }
 }
 
-#[derive(Default)]
-pub enum LaunchSize {
+#[derive(Default, PartialEq)]
+pub enum WorkSize2D {
     #[default]
     FullScreen,
     FractionalFullScreen(u32, u32),
@@ -260,26 +266,27 @@ pub enum LaunchSize {
     Custom(fn() -> UVec2),
 }
 
-impl LaunchSize {
+impl WorkSize2D {
     fn size(&self) -> (u32, u32) {
         match self {
-            LaunchSize::Custom(func) => {
+            WorkSize2D::Custom(func) => {
                 let res = func();
                 (res.x, res.y)
             }
-            LaunchSize::FractionalFullScreen(x, y) => (
+            WorkSize2D::FractionalFullScreen(x, y) => (
                 (WINDOW_SIZE.x as u32).div_ceil(*x),
                 (WINDOW_SIZE.y as u32).div_ceil(*y),
             ),
-            LaunchSize::FullScreen => (WINDOW_SIZE.x as u32, WINDOW_SIZE.y as u32),
-            LaunchSize::X(x) => (*x, 1),
-            LaunchSize::XY(x, y) => (*x, *y),
+            WorkSize2D::FullScreen => (WINDOW_SIZE.x as u32, WINDOW_SIZE.y as u32),
+            WorkSize2D::X(x) => (*x, 1),
+            WorkSize2D::XY(x, y) => (*x, *y),
         }
     }
 }
 
+#[derive(PartialEq)]
 pub(crate) struct RayTracingPass {
-    launch: LaunchSize,
+    launch: WorkSize2D,
     pipeline: RayTracingPipelineHandle,
 }
 
@@ -287,7 +294,7 @@ impl RayTracingPass {
     pub(crate) fn new<'a>(rg: &'a mut RenderGraph) -> NodeBuilder<'a, RayTracingPass> {
         let mut builder = NodeBuilder::<RayTracingPass>::new::<RayTracingPass>(rg);
         builder.execution = MaybeUninit::new(RayTracingPass {
-            launch: LaunchSize::FullScreen,
+            launch: WorkSize2D::FullScreen,
             pipeline: RayTracingPipelineHandle {
                 path: "".to_string(),
                 entry: "main".to_string(),
@@ -306,19 +313,192 @@ impl<'b> NodeBuilder<'b, RayTracingPass> {
         unsafe { self.execution.assume_init_mut() }.pipeline.entry = entry.to_string();
         self
     }
-    pub(crate) fn launch(mut self, launch: LaunchSize) -> NodeHandle {
+    pub(crate) fn launch(mut self, launch: WorkSize2D) -> NodeHandle {
         unsafe { self.execution.assume_init_mut() }.launch = launch;
         self.build()
     }
 }
 
-impl Execution for RayTracingPass {
-    fn execute(&self, cmd: &vk::CommandBuffer) -> Result<()> {
+impl ExecutionTrait for RayTracingPass {
+    fn execute(&self, cmd: &vk::CommandBuffer, rg: &RenderGraph, edges: &[NodeEdge]) -> Result<()> {
         let (x, y) = self.launch.size();
         self.pipeline.launch(cmd, x, y);
         Ok(())
     }
     fn get_stages(&self) -> vk::PipelineStageFlags2 {
         vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
+    }
+}
+
+#[derive(PartialEq)]
+pub(crate) struct RasterPass {
+    dispatch: DispatchSize,
+    render_area: WorkSize2D,
+    pipeline: RasterPipelineHandle,
+}
+
+impl ExecutionTrait for RasterPass {
+    fn execute(&self, cmd: &vk::CommandBuffer, rg: &RenderGraph, edges: &[NodeEdge]) -> Result<()> {
+        let (x, y, z) = self.dispatch.size();
+        let (width, height) = self.render_area.size();
+        let color_attachments = edges
+            .iter()
+            .filter_map(|e| {
+                if e.edge_type == EdgeType::ColorAttachment {
+                    Some(rg.image_handle(e.resource).unwrap())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let depth_attachment = edges
+            .iter()
+            .find(|e| e.edge_type == EdgeType::DepthAttachment)
+            .and_then(|e| rg.image_handle(e.resource));
+        let stencil_attachment = edges
+            .iter()
+            .find(|e| e.edge_type == EdgeType::StencilAttachment)
+            .and_then(|e| rg.image_handle(e.resource));
+        self.pipeline.dispatch(
+            *cmd,
+            &color_attachments,
+            &depth_attachment,
+            &stencil_attachment,
+            width,
+            height,
+            x,
+            y,
+            z,
+        );
+        Ok(())
+    }
+    fn get_stages(&self) -> vk::PipelineStageFlags2 {
+        vk::PipelineStageFlags2::ALL_GRAPHICS
+    }
+}
+
+impl RasterPass {
+    pub(crate) fn new<'a>(rg: &'a mut RenderGraph) -> NodeBuilder<'a, RasterPass> {
+        let mut builder = NodeBuilder::<RasterPass>::new::<RasterPass>(rg);
+        builder.execution = MaybeUninit::new(RasterPass {
+            dispatch: DispatchSize::FullScreen,
+            render_area: WorkSize2D::FullScreen,
+            pipeline: RasterPipelineHandle {
+                fragment_entry: "main".to_string(),
+                mesh_entry: "main".to_string(),
+                fragment_path: "".to_string(),
+                mesh_path: "".to_string(),
+                color_formats: Vec::new(),
+                depth_format: vk::Format::UNDEFINED,
+                stencil_format: vk::Format::UNDEFINED,
+            },
+        });
+        builder
+    }
+}
+
+impl<'b> NodeBuilder<'b, RasterPass> {
+    pub(crate) fn mesh_shader(mut self, path: &str) -> Self {
+        unsafe { self.execution.assume_init_mut() }
+            .pipeline
+            .mesh_path = path.to_string();
+        self
+    }
+    pub(crate) fn mesh_entry(mut self, entry: &str) -> Self {
+        unsafe { self.execution.assume_init_mut() }
+            .pipeline
+            .mesh_entry = entry.to_string();
+        self
+    }
+    pub(crate) fn fragment_shader(mut self, path: &str) -> Self {
+        unsafe { self.execution.assume_init_mut() }
+            .pipeline
+            .fragment_path = path.to_string();
+        self
+    }
+    pub(crate) fn fragment_entry(mut self, entry: &str) -> Self {
+        unsafe { self.execution.assume_init_mut() }
+            .pipeline
+            .fragment_entry = entry.to_string();
+        self
+    }
+
+    pub(crate) fn render_area(mut self, render_area: WorkSize2D) -> Self {
+        unsafe { self.execution.assume_init_mut() }.render_area = render_area;
+        self
+    }
+    pub(crate) fn draw(mut self, dispatch_size: DispatchSize) -> NodeHandle {
+        {
+            let pipeline = unsafe { self.execution.assume_init_mut() };
+            pipeline.dispatch = dispatch_size;
+            pipeline.pipeline.color_formats = self
+                .edges
+                .iter()
+                .filter_map(|a| {
+                    if a.edge_type == EdgeType::ColorAttachment {
+                        Some(self.rg.image_handle(a.resource).unwrap().format)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            pipeline.pipeline.depth_format = self
+                .edges
+                .iter()
+                .find(|e| e.edge_type == EdgeType::DepthAttachment)
+                .and_then(|d| Some(self.rg.image_handle(d.resource).unwrap().format))
+                .unwrap_or(vk::Format::UNDEFINED);
+            pipeline.pipeline.stencil_format = self
+                .edges
+                .iter()
+                .find(|e| e.edge_type == EdgeType::StencilAttachment)
+                .and_then(|d| Some(self.rg.image_handle(d.resource).unwrap().format))
+                .unwrap_or(vk::Format::UNDEFINED);
+        }
+        self.build()
+    }
+
+    pub(crate) fn color_attachment(
+        mut self,
+        last_read: NodeHandle,
+        handle: ResourceHandle,
+    ) -> Self {
+        self.edges.push(NodeEdge {
+            layout: Some(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+            origin: if last_read == IMPORTED {
+                None
+            } else {
+                Some(last_read)
+            },
+            edge_type: EdgeType::ColorAttachment,
+            resource: handle,
+        });
+        self
+    }
+    pub(crate) fn depth_attachment(mut self, origin: NodeHandle, handle: ResourceHandle) -> Self {
+        self.edges.push(NodeEdge {
+            layout: Some(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL),
+            origin: if origin == IMPORTED {
+                None
+            } else {
+                Some(origin)
+            },
+            edge_type: EdgeType::DepthAttachment,
+            resource: handle,
+        });
+        self
+    }
+    pub(crate) fn stencil_attachment(mut self, origin: NodeHandle, handle: ResourceHandle) -> Self {
+        self.edges.push(NodeEdge {
+            layout: Some(vk::ImageLayout::STENCIL_ATTACHMENT_OPTIMAL),
+            origin: if origin == IMPORTED {
+                None
+            } else {
+                Some(origin)
+            },
+            edge_type: EdgeType::StencilAttachment,
+            resource: handle,
+        });
+        self
     }
 }
