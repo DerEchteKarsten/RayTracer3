@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ffi::c_void};
+use std::{collections::{HashMap, HashSet}, ffi::c_void};
 
 use anyhow::Result;
 use ash::vk::{self, Format, ImageUsageFlags};
@@ -27,35 +27,8 @@ pub mod build;
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
 pub struct ResourceHandle(u32);
 
-#[derive(PartialEq)]
-enum ResourceMemoryType {
-    ImportedBuffer = 0,
-    ImportedImage = 1,
-    Buffer = 2,
-    Image = 3,
-    ExternalReadonly = 4,
-}
+pub const IMPORTED: NodeHandle = "";
 
-pub const IMPORTED: NodeHandle = !0;
-
-impl ResourceHandle {
-    const fn new(ty: ResourceMemoryType, index: usize) -> Self {
-        Self((ty as u8 as u32) << 24u32 | index as u32)
-    }
-    fn index(&self) -> usize {
-        (self.0 & !(0xff << 24)) as usize
-    }
-    fn ty(&self) -> ResourceMemoryType {
-        match self.0 >> 24 {
-            0 => ResourceMemoryType::ImportedBuffer,
-            1 => ResourceMemoryType::ImportedImage,
-            2 => ResourceMemoryType::Buffer,
-            3 => ResourceMemoryType::Image,
-            4 => ResourceMemoryType::ExternalReadonly,
-            _ => unreachable!(),
-        }
-    }
-}
 
 #[derive(PartialEq, Eq)]
 enum ResourceType {
@@ -85,7 +58,7 @@ struct Resource {
     ty: ResourceType,
 }
 
-type NodeHandle = usize;
+type NodeHandle = &'static str;
 
 #[enum_dispatch]
 pub trait ExecutionTrait {
@@ -104,14 +77,8 @@ enum Execution {
 #[derive(PartialEq)]
 struct Node {
     execution: Execution,
+    constant_offset: Option<u32>,
     edges: Vec<NodeEdge>,
-    constants: Option<Constant>,
-}
-
-#[derive(PartialEq, Eq, Clone)]
-struct Constant {
-    pointer: *const c_void,
-    size: usize,
 }
 
 impl Node {
@@ -120,26 +87,6 @@ impl Node {
             .iter()
             .filter_map(|r| r.origin)
             .collect::<Vec<_>>()
-    }
-
-    fn depends_on(&self, rg: &RenderGraph, other: &Node) -> bool {
-        let other_index = rg.graph.element_offset(other).unwrap();
-        other == self
-            || self
-                .edges
-                .iter()
-                .find(|e| {
-                    if let Some(origin) = e.origin
-                        && origin == other_index
-                        && (e.edge_type == EdgeType::ShaderRead
-                            || e.edge_type == EdgeType::ShaderReadWrite)
-                    {
-                        true
-                    } else {
-                        false
-                    }
-                })
-                .is_some()
     }
 
     fn bindings<'b>(
@@ -153,6 +100,26 @@ impl Node {
     }
 }
 
+pub fn depends_on(s: NodeHandle, rg: &RenderGraph, other: NodeHandle) -> bool {
+    other == s
+        || rg.nodes[other]
+            .edges
+            .iter()
+            .find(|e| {
+                if let Some(origin) = e.origin
+                    && origin == other
+                    && (e.edge_type == EdgeType::ShaderRead
+                        || e.edge_type == EdgeType::ShaderReadWrite)
+                {
+                    true
+                } else {
+                    false
+                }
+            })
+            .is_some()
+}
+
+
 #[derive(Clone)]
 struct FrameData {
     command_pool: vk::CommandPool,
@@ -163,11 +130,12 @@ struct FrameData {
 pub struct RenderGraph {
     resources: Vec<Resource>,
 
-    constants_buffer: ResourceHandle,
-    descriptor_buffer: ResourceHandle,
+    constants_buffer: Resource,
+    descriptor_buffer: Resource,
 
-    graph: Vec<Node>,
-    constants_cache: Vec<(Constant, usize)>,
+    graph: HashSet<NodeHandle>,
+    nodes: HashMap<NodeHandle, Node>,
+    constants: Vec<(*const c_void, usize)>,
 
     frame_data: [FrameData; FRAMES_IN_FLIGHT],
     frame_timeline_semaphore: vk::Semaphore,
@@ -250,7 +218,11 @@ impl Importable for BufferHandle {
 }
 impl Importable for Image {
     fn resource(self) -> Resource {
-        let descriptor = BindlessDescriptorHeap::get_mut().allocate_image_handle(&self);
+        let descriptor = if self.usage.contains(vk::ImageUsageFlags::STORAGE) {
+            BindlessDescriptorHeap::get_mut().allocate_image_handle(&self)
+        }else {
+            BindlessDescriptorHeap::get_mut().allocate_texture_handle(&self)
+        };
         Resource {
             descriptor: descriptor,
             ty: ResourceType::Image(self),
@@ -259,7 +231,11 @@ impl Importable for Image {
 }
 impl Importable for ImageHandle {
     fn resource(self) -> Resource {
-        let descriptor = BindlessDescriptorHeap::get_mut().allocate_image_handle(&self);
+        let descriptor = if self.usage.contains(vk::ImageUsageFlags::STORAGE) {
+            BindlessDescriptorHeap::get_mut().allocate_image_handle(&self)
+        }else {
+            BindlessDescriptorHeap::get_mut().allocate_texture_handle(&self)
+        };
         Resource {
             descriptor: descriptor,
             ty: ResourceType::Image(Image {
@@ -331,7 +307,7 @@ impl RenderGraph {
                     descriptor,
                     ty: ResourceType::Image(image.clone()),
                 });
-                ResourceHandle::new(ResourceMemoryType::ImportedImage, index)
+                ResourceHandle(index as u32)
             })
             .collect::<Vec<_>>();
         let descriptor_buffer = {
@@ -342,12 +318,10 @@ impl RenderGraph {
             )
             .unwrap();
             let descriptor = BindlessDescriptorHeap::get_mut().allocate_buffer_handle(&buffer);
-            let index = resources.len();
-            resources.push(Resource {
+            Resource {
                 descriptor,
                 ty: ResourceType::Buffer(buffer),
-            });
-            ResourceHandle::new(ResourceMemoryType::Buffer, index)
+            }
         };
 
         let constants_buffer = {
@@ -358,17 +332,16 @@ impl RenderGraph {
             )
             .unwrap();
             let descriptor = BindlessDescriptorHeap::get_mut().allocate_buffer_handle(&buffer);
-            let index = resources.len();
-            resources.push(Resource {
+            Resource {
                 descriptor,
                 ty: ResourceType::Buffer(buffer),
-            });
-            ResourceHandle::new(ResourceMemoryType::Buffer, index)
+            }
         };
 
         Self {
-            constants_cache: Vec::new(),
-            graph: Vec::new(),
+            constants: Vec::new(),
+            graph: HashSet::new(),
+            nodes: HashMap::new(),
             swapchain,
             frame_data,
             frame_number: 0,
@@ -385,14 +358,11 @@ impl RenderGraph {
         self.swapchain_images[self.swapchain_image_index]
     }
 
-    pub fn get_swapchain_format(&self) -> vk::Format {
-        self.swapchain.format
-    }
-
-    fn import(&mut self, value: impl Importable) -> ResourceHandle {
+    fn import<T>(&mut self, value: T) -> ResourceHandle 
+    where T: Importable {
         let index = self.resources.len();
         self.resources.push(value.resource());
-        ResourceHandle::new(ResourceMemoryType::ExternalReadonly, index)
+        ResourceHandle(index as u32)
     }
 
     pub fn buffer(&mut self, size: u64, usage: vk::BufferUsageFlags) -> ResourceHandle {
@@ -412,14 +382,14 @@ impl RenderGraph {
     }
 
     fn image_handle<'a>(&'a self, handle: ResourceHandle) -> Option<ImageHandle> {
-        if let ResourceType::Image(image) = &self.resources[handle.index()].ty {
+        if let ResourceType::Image(image) = &self.resources[handle.0 as usize].ty {
             Some(image.handle())
         } else {
             None
         }
     }
     fn buffer_handle<'a>(&'a self, handle: ResourceHandle) -> Option<BufferHandle> {
-        if let ResourceType::Buffer(buffer) = &self.resources[handle.index()].ty {
+        if let ResourceType::Buffer(buffer) = &self.resources[handle.0 as usize].ty {
             Some(buffer.handle())
         } else {
             None

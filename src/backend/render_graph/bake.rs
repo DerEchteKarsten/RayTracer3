@@ -1,35 +1,32 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     os::raw::c_void,
-    time::{Duration, Instant},
 };
 
-use anyhow::{Error, Result};
+use anyhow::Result;
 use ash::vk;
 
 use crate::{
     backend::bindless::BindlessDescriptorHeap,
-    vulkan::{buffer::Buffer, image::ImageType, swapchain::FRAMES_IN_FLIGHT, Context},
-    GConst,
+    vulkan::{image::ImageType, swapchain::FRAMES_IN_FLIGHT, Context},
 };
 
 use super::{
-    EdgeType, ExecutionTrait, Node, NodeEdge, NodeHandle, RenderGraph, ResourceHandle,
-    ResourceMemoryType, IMPORTED,
+    ExecutionTrait, NodeHandle, RenderGraph,
 };
 
 impl RenderGraph {
     fn flatten<'a>(&'a self, root_node: NodeHandle) -> Vec<NodeHandle> {
         let mut flatt = vec![];
         let mut queue = VecDeque::new();
-        let mut visited = vec![false; self.graph.len()];
+        let mut visited: HashMap<&'static str, bool> = HashMap::new();
 
         visited[root_node] = true;
         queue.push_front(root_node);
 
         while !queue.is_empty() {
             let current_index = queue.pop_front().unwrap();
-            let current = &self.graph[current_index];
+            let current = &self.nodes[current_index];
             flatt.push(current_index);
 
             for c in current.parents() {
@@ -94,11 +91,11 @@ impl RenderGraph {
             if pass.bindings().count() != 0 {
                 let bindings = pass
                     .bindings()
-                    .map(|e| self.resources[e.resource.index()].descriptor)
+                    .map(|e| self.resources[e.resource.0 as usize].descriptor)
                     .collect::<Vec<_>>();
 
                 unsafe {
-                    (self.resources[self.descriptor_buffer.index()]
+                    (self.descriptor_buffer
                         .ty
                         .buffer()
                         .allocation
@@ -116,27 +113,10 @@ impl RenderGraph {
             }
         }
 
-        let buffer_ptr = self.resources[self.constants_buffer.index()]
-            .ty
-            .buffer()
-            .allocation
-            .as_ref()
-            .unwrap()
-            .mapped_ptr()
-            .unwrap()
-            .as_ptr() as *mut c_void;
-        self.constants_cache.iter().for_each(|(constants, offset)| {
-            unsafe {
-                constants
-                    .pointer
-                    .copy_to(buffer_ptr.add(*offset), constants.size)
-            };
-        });
-
         Ok(())
     }
     pub fn begin_frame(&mut self) {
-        self.constants_cache.clear();
+        self.constants.clear();
         self.graph.clear();
         let frame_in_flight = self.frame_number as usize % FRAMES_IN_FLIGHT;
         let frame = self.frame_data[frame_in_flight].clone();
@@ -182,7 +162,7 @@ impl RenderGraph {
 
         self.write_bindings().unwrap();
 
-        for (i, pass_index) in execution_order.iter().enumerate() {
+        for pass_index in execution_order.iter() {
             let pass = &self.graph[*pass_index];
             let mut image_barriers = Vec::new();
             let mut buffer_barriers = Vec::new();
@@ -259,14 +239,7 @@ impl RenderGraph {
                 let mut constants = [0u8; 16];
                 constants[0..4].copy_from_slice(
                     &pass
-                        .constants
-                        .as_ref()
-                        .and_then(|constant| {
-                            self.constants_cache
-                                .iter()
-                                .find(|c| c.0 == *constant)
-                                .and_then(|c| Some(c.1 as u32))
-                        })
+                        .constant_offset
                         .unwrap_or(0)
                         .to_ne_bytes(),
                 );
@@ -283,9 +256,9 @@ impl RenderGraph {
                     .to_ne_bytes(),
                 );
                 constants[8..12]
-                    .copy_from_slice(&(self.descriptor_buffer.index() as u32).to_ne_bytes());
+                    .copy_from_slice(&(self.descriptor_buffer.descriptor.index()).to_ne_bytes());
                 constants[12..16]
-                    .copy_from_slice(&(self.constants_buffer.index() as u32).to_ne_bytes());
+                    .copy_from_slice(&(self.constants_buffer.descriptor.index()).to_ne_bytes());
 
                 ctx.device.cmd_push_constants(
                     frame.cmd,

@@ -333,7 +333,23 @@ impl Context {
                 .create_fence(&vk::FenceCreateInfo::default(), None)?
         };
 
-        self.queue_submit(&command_buffer, None, None, &fence, false)?;
+        let cmd_buffer_submit_info =
+            vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer);
+
+        let submit_info = vk::SubmitInfo2::default()
+            .command_buffer_infos(std::slice::from_ref(&cmd_buffer_submit_info));
+
+        unsafe {
+            self.device.queue_submit2(
+                if false {
+                    self.graphics_queue
+                } else {
+                    self.graphics_queue
+                },
+                std::slice::from_ref(&submit_info),
+                fence,
+            )?
+        };
 
         unsafe { self.device.wait_for_fences(&[fence], true, u64::MAX)? };
         unsafe {
@@ -342,57 +358,6 @@ impl Context {
         };
 
         Ok(executor_result)
-    }
-
-    fn queue_submit(
-        &self,
-        command_buffer: &vk::CommandBuffer,
-        wait_semaphore: Option<vk::SemaphoreSubmitInfo>,
-        signal_semaphore: Option<vk::SemaphoreSubmitInfo>,
-        fence: &vk::Fence,
-        present: bool,
-    ) -> Result<()> {
-        let wait_semaphore_submit_info = wait_semaphore.map(|s| {
-            vk::SemaphoreSubmitInfo::default()
-                .semaphore(s.semaphore)
-                .stage_mask(s.stage_mask)
-        });
-
-        let signal_semaphore_submit_info = signal_semaphore.map(|s| {
-            vk::SemaphoreSubmitInfo::default()
-                .semaphore(s.semaphore)
-                .stage_mask(s.stage_mask)
-        });
-
-        let cmd_buffer_submit_info =
-            vk::CommandBufferSubmitInfo::default().command_buffer(*command_buffer);
-
-        let submit_info = vk::SubmitInfo2::default()
-            .command_buffer_infos(std::slice::from_ref(&cmd_buffer_submit_info));
-
-        let submit_info = match wait_semaphore_submit_info.as_ref() {
-            Some(info) => submit_info.wait_semaphore_infos(std::slice::from_ref(info)),
-            None => submit_info,
-        };
-
-        let submit_info = match signal_semaphore_submit_info.as_ref() {
-            Some(info) => submit_info.signal_semaphore_infos(std::slice::from_ref(info)),
-            None => submit_info,
-        };
-
-        unsafe {
-            self.device.queue_submit2(
-                if present {
-                    self.graphics_queue
-                } else {
-                    self.graphics_queue
-                },
-                std::slice::from_ref(&submit_info),
-                *fence,
-            )?
-        };
-
-        Ok(())
     }
 
     pub(crate) fn set_debug_name<T>(&self, name: &str, object: T)

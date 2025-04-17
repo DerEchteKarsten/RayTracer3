@@ -57,6 +57,7 @@ struct GConst {
     pub proberng: u32,
     pub cell_size: f32,
     pub mouse: [u32; 2],
+    pub pad: [u32; 2],
 }
 
 fn main() {
@@ -270,17 +271,17 @@ fn main() {
                             .mesh_entry("vertex")
                             .constants(&gconst)
                             .depth_attachment(IMPORTED, depth)
-                            .color_attachment(IMPORTED, swapchain)
+                            .color_attachment(IMPORTED, color)
                             .render_area(WorkSize2D::FullScreen)
                             .draw(DispatchSize::X(1));
 
-                        // let test = ComputePass::new(&mut rg)
-                        //     .shader("bindless_test")
-                        //     .read(test2, depth)
-                        //     .read(test2, color)
-                        //     .write(IMPORTED, swapchain)
-                        //     .dispatch(DispatchSize::FullScreen);
-                        rg.draw_frame(test2);
+                        let test = ComputePass::new(&mut rg)
+                            .shader("bindless_test")
+                            .read(test2, depth)
+                            .read(test2, color)
+                            .write(IMPORTED, swapchain)
+                            .dispatch(DispatchSize::FullScreen);
+                        rg.draw_frame(test);
                         // let ui = imgui.context.frame();
                         // ui.window("Constants Editor")
                         //     .size([300.0, WINDOW_SIZE.y as f32], Condition::FirstUseEver)

@@ -15,13 +15,13 @@ use crate::backend::pipeline_cache::{
 use crate::raytracing::{RayTracingContext, RayTracingShaderCreateInfo, ShaderBindingTable};
 use crate::vulkan::Context;
 
-use crate::WINDOW_SIZE;
+use crate::{GConst, WINDOW_SIZE};
 
 use derivative::Derivative;
 
 use super::{
-    Constant, EdgeType, Execution, ExecutionTrait, Node, NodeEdge, NodeHandle, RenderGraph,
-    ResourceHandle, ResourceMemoryType, FRAMES_IN_FLIGHT, IMPORTED,
+    EdgeType, Execution, ExecutionTrait, Node, NodeEdge, NodeHandle, RenderGraph,
+    ResourceHandle, IMPORTED,
 };
 
 use std::ffi::{self, c_void};
@@ -30,6 +30,7 @@ pub struct NodeBuilder<'a, T>
 where
     T: ExecutionTrait + 'static,
 {
+    name: &'static str,
     rg: &'a mut RenderGraph,
     execution: MaybeUninit<T>,
     edges: Vec<NodeEdge>,
@@ -42,8 +43,9 @@ where
     T: ExecutionTrait + 'static,
     Execution: From<T>,
 {
-    fn new<E: ExecutionTrait + 'static>(rg: &'b mut RenderGraph) -> NodeBuilder<'b, E> {
+    fn new<E: ExecutionTrait + 'static>(rg: &'b mut RenderGraph, name: &'static str) -> NodeBuilder<'b, E> {
         NodeBuilder::<'b, E> {
+            name,
             rg,
             execution: MaybeUninit::uninit(),
             edges: Vec::new(),
@@ -60,7 +62,7 @@ where
 
     pub fn read(mut self, origin: NodeHandle, handle: ResourceHandle) -> Self {
         if origin != IMPORTED {
-            let prev = self.rg.graph[origin]
+            let prev = self.rg.nodes[origin]
                 .edges
                 .iter()
                 .find(|e| e.resource == handle)
@@ -118,36 +120,59 @@ where
         self
     }
     fn build(self) -> NodeHandle {
-        let node = Node {
-            edges: self.edges,
-            execution: Execution::from(unsafe { self.execution.assume_init() }),
-            constants: self.constants.and_then(|constants| {
-                let c = Constant {
-                    pointer: constants,
-                    size: self.constants_size,
-                };
-                if self
+        let offset = if let Some(constants) = self.constants {
+            if let Some(found_constants) = self
+                .rg
+                .constants
+                .iter()
+                .position(|co| co.0 == constants)
+            {
+                let offset: usize = self
                     .rg
-                    .constants_cache
+                    .constants[..found_constants]
                     .iter()
-                    .find(|co| co.0 == c)
-                    .is_none()
-                {
-                    let offset = self
-                        .rg
-                        .constants_cache
-                        .last()
-                        .and_then(|l| Some(l.1 + l.0.size))
-                        .unwrap_or(0);
-                    self.rg.constants_cache.push((c.clone(), offset));
-                }
-                Some(c)
-            }),
-        };
+                    .map(|c| c.1)
+                    .sum();
+                Some(offset as u32)
+            } else {
+                let offset = self
+                    .rg
+                    .constants
+                    .iter()
+                    .map(|c| c.1)
+                    .sum();
+                self.rg.constants.push((constants.clone(), self.constants_size));
 
-        let handle = self.rg.graph.len();
-        self.rg.graph.push(node);
-        handle
+                let buffer_ptr = self.rg.constants_buffer
+                    .ty
+                    .buffer()
+                    .allocation
+                    .as_ref()
+                    .unwrap()
+                    .mapped_ptr()
+                    .unwrap()
+                    .as_ptr() as *mut c_void;
+                unsafe {
+                    constants
+                        .copy_to(buffer_ptr.add(offset), self.constants_size)
+                };
+                Some(offset as u32)
+            }
+        }else {
+            None
+        };  
+
+        match self.rg.nodes.get_mut(self.name) {
+            None => {self.rg.nodes.insert(self.name, Node {
+                constant_offset: offset,
+                edges: self.edges,
+                execution: Execution::from(unsafe { self.execution.assume_init() }),
+            });},
+            Some(node) => {node.edges = self.edges;}
+        }
+
+        self.rg.graph.insert(self.name);
+        self.name
     }
 }
 
@@ -212,8 +237,8 @@ pub(crate) struct ComputePass {
 }
 
 impl ComputePass {
-    pub(crate) fn new<'a>(rg: &'a mut RenderGraph) -> NodeBuilder<'a, ComputePass> {
-        let mut builder = NodeBuilder::<ComputePass>::new::<ComputePass>(rg);
+    pub(crate) fn new<'a>(rg: &'a mut RenderGraph, name: &'static str) -> NodeBuilder<'a, ComputePass> {
+        let mut builder = NodeBuilder::<ComputePass>::new::<ComputePass>(rg, name);
         builder.execution = MaybeUninit::new(ComputePass {
             pipeline: ComputePipelineHandle {
                 path: "".to_owned(),
@@ -291,8 +316,8 @@ pub(crate) struct RayTracingPass {
 }
 
 impl RayTracingPass {
-    pub(crate) fn new<'a>(rg: &'a mut RenderGraph) -> NodeBuilder<'a, RayTracingPass> {
-        let mut builder = NodeBuilder::<RayTracingPass>::new::<RayTracingPass>(rg);
+    pub(crate) fn new<'a>(rg: &'a mut RenderGraph, name: &'static str) -> NodeBuilder<'a, RayTracingPass> {
+        let mut builder = NodeBuilder::<RayTracingPass>::new::<RayTracingPass>(rg, name);
         builder.execution = MaybeUninit::new(RayTracingPass {
             launch: WorkSize2D::FullScreen,
             pipeline: RayTracingPipelineHandle {
@@ -320,7 +345,7 @@ impl<'b> NodeBuilder<'b, RayTracingPass> {
 }
 
 impl ExecutionTrait for RayTracingPass {
-    fn execute(&self, cmd: &vk::CommandBuffer, rg: &RenderGraph, edges: &[NodeEdge]) -> Result<()> {
+    fn execute(&self, cmd: &vk::CommandBuffer, _: &RenderGraph, _: &[NodeEdge]) -> Result<()> {
         let (x, y) = self.launch.size();
         self.pipeline.launch(cmd, x, y);
         Ok(())
@@ -378,8 +403,8 @@ impl ExecutionTrait for RasterPass {
 }
 
 impl RasterPass {
-    pub(crate) fn new<'a>(rg: &'a mut RenderGraph) -> NodeBuilder<'a, RasterPass> {
-        let mut builder = NodeBuilder::<RasterPass>::new::<RasterPass>(rg);
+    pub(crate) fn new<'a>(rg: &'a mut RenderGraph, name: &'static str) -> NodeBuilder<'a, RasterPass> {
+        let mut builder = NodeBuilder::<RasterPass>::new::<RasterPass>(rg, name);
         builder.execution = MaybeUninit::new(RasterPass {
             dispatch: DispatchSize::FullScreen,
             render_area: WorkSize2D::FullScreen,
@@ -388,9 +413,6 @@ impl RasterPass {
                 mesh_entry: "main".to_string(),
                 fragment_path: "".to_string(),
                 mesh_path: "".to_string(),
-                color_formats: Vec::new(),
-                depth_format: vk::Format::UNDEFINED,
-                stencil_format: vk::Format::UNDEFINED,
             },
         });
         builder
@@ -431,29 +453,6 @@ impl<'b> NodeBuilder<'b, RasterPass> {
         {
             let pipeline = unsafe { self.execution.assume_init_mut() };
             pipeline.dispatch = dispatch_size;
-            pipeline.pipeline.color_formats = self
-                .edges
-                .iter()
-                .filter_map(|a| {
-                    if a.edge_type == EdgeType::ColorAttachment {
-                        Some(self.rg.image_handle(a.resource).unwrap().format)
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-            pipeline.pipeline.depth_format = self
-                .edges
-                .iter()
-                .find(|e| e.edge_type == EdgeType::DepthAttachment)
-                .and_then(|d| Some(self.rg.image_handle(d.resource).unwrap().format))
-                .unwrap_or(vk::Format::UNDEFINED);
-            pipeline.pipeline.stencil_format = self
-                .edges
-                .iter()
-                .find(|e| e.edge_type == EdgeType::StencilAttachment)
-                .and_then(|d| Some(self.rg.image_handle(d.resource).unwrap().format))
-                .unwrap_or(vk::Format::UNDEFINED);
         }
         self.build()
     }

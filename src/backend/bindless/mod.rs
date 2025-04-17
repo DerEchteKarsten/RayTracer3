@@ -64,20 +64,14 @@ impl RenderResourceTag {
 }
 
 impl DescriptorResourceHandle {
-    pub fn new(_version: u8, tag: RenderResourceTag, index: u32) -> Self {
-        // Self(((tag as u32) << 24) | index)
-        Self(index)
+    pub fn new(tag: RenderResourceTag, index: u32) -> Self {
+        Self(((tag as u32) << 30) | index)
     }
     fn bump_version_and_update_tag(self, tag: RenderResourceTag) -> Self {
-        self
+        Self::new(tag, self.index())
     }
-
     pub fn index(&self) -> u32 {
-        self.0 // self.0 & 0xffffff
-    }
-
-    pub fn to_bytes(&self) -> [u8; 4] {
-        self.0.to_ne_bytes()
+        self.0 & 0xfffffff
     }
 }
 
@@ -185,7 +179,7 @@ impl BindlessDescriptorHeap {
 
     fn fetch_available_descriptor(&mut self, tag: RenderResourceTag) -> DescriptorResourceHandle {
         self.available_recycled_descriptors.pop_front().map_or_else(
-            || DescriptorResourceHandle::new(0, tag, self.increment_descriptor(tag.table())),
+            || DescriptorResourceHandle::new(tag, self.increment_descriptor(tag.table())),
             |recycled_handle| recycled_handle.bump_version_and_update_tag(tag),
         )
     }

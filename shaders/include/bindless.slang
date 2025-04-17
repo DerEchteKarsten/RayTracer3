@@ -1,5 +1,5 @@
 #pragma once
-
+#define DEBUG
 #define NUM_STATIC_SAMPLERS 4
 struct Offsets {
     uint32_t constants;
@@ -20,18 +20,40 @@ struct Offsets {
 [vk::binding(0, 2)] SamplerState samplerHandles[];
 [vk::binding(0, 3)] RaytracingAccelerationStructure tlasHandles[];
 
-T loadBindings<T>() {
-    return bufferHandles[g_offsets.bindings_buffer.index].Load<T>(g_offsets.bindings);
+enum RenderResourceTag {
+    Buffer = 0,
+    Image = 1,
+    Texture = 2,
+    AccelerationStructure = 3,
 }
 
+//TODO Validation
+T loadBindings<T>() {
+    #ifdef DEBUG
+        if(g_offsets.bindings_buffer.tag() != RenderResourceTag::Buffer) {
+            printf("Bindings Buffer is not a Buffer! is %i insted", g_offsets.bindings_buffer.tag());
+            T t;
+            return t;
+        }
+    #endif
+    return bufferHandles[g_offsets.bindings_buffer.index()].Load<T>(g_offsets.bindings);
+}
 
 T loadConstants<T>() {
-    return bufferHandles[g_offsets.constants_buffer.index].Load<T>(g_offsets.constants);
+    return bufferHandles[g_offsets.constants_buffer.index()].Load<T>(g_offsets.constants);
 }
 
 
 struct RenderResourceHandle {
-    uint index;
+    uint handle;
+    
+    uint index() {
+        return handle & 0xfffffff;
+    }
+
+    uint tag() {
+        return handle >> 30;
+    }
 }
 
 struct Buffer<T> {
@@ -39,8 +61,8 @@ struct Buffer<T> {
 
     __subscript(int i) -> T
     {
-        get { return bufferHandles[handle.index].Load<T>(sizeof(T) * i); }
-        set { bufferHandles[handle.index].Store<T>(sizeof(T) * i, newValue); }
+        get { return bufferHandles[handle.index()].Load<T>(sizeof(T) * i); }
+        set { bufferHandles[handle.index()].Store<T>(sizeof(T) * i, newValue); }
     }
 }
 
@@ -49,8 +71,8 @@ struct Image4 {
 
     __subscript(vector<uint, 2> i) -> vector<float, 4>
     {
-        get { return imageHandlesf4[handle.index][i]; }
-        set { imageHandlesf4[handle.index][i] = newValue; }
+        get { return imageHandlesf4[handle.index()][i]; }
+        set { imageHandlesf4[handle.index()][i] = newValue; }
     }
 }
 
@@ -59,8 +81,8 @@ struct Image2 {
 
     __subscript(int2 i) -> vector<float, 2>
     {
-        get { return imageHandlesf2[handle.index][i]; }
-        set { imageHandlesf2[handle.index][i] = newValue; }
+        get { return imageHandlesf2[handle.index()][i]; }
+        set { imageHandlesf2[handle.index()][i] = newValue; }
     }
 }
 
@@ -69,8 +91,8 @@ struct Image1 {
 
     __subscript(int2 i) -> float
     {
-        get { return imageHandlesf1[handle.index][i]; }
-        set { imageHandlesf1[handle.index][i] = newValue; }
+        get { return imageHandlesf1[handle.index()][i]; }
+        set { imageHandlesf1[handle.index()][i] = newValue; }
     }
 }
 
@@ -80,11 +102,11 @@ struct Texture4 {
 
     __subscript(int2 i) -> vector<float, 4>
     {
-        get { return textureHandles4[handle.index][i]; }
+        get { return textureHandles4[handle.index()][i]; }
     }
     
     float4 sampleLevel2D(SamplerState s, float2 uv, float mip) {
-        return textureHandles4[handle.index].SampleLevel(s, uv, mip);
+        return textureHandles4[handle.index()].SampleLevel(s, uv, mip);
     }
 }
 
@@ -93,11 +115,11 @@ struct Texture3 {
 
     __subscript(int2 i) -> vector<float, 3>
     {
-        get { return textureHandles3[handle.index][i]; }
+        get { return textureHandles3[handle.index()][i]; }
     }
 
     float3 sampleLevel2D(SamplerState s, float2 uv, float mip) {
-        return textureHandles3[handle.index].SampleLevel(s, uv, mip);
+        return textureHandles3[handle.index()].SampleLevel(s, uv, mip);
     }
 }
 
@@ -106,10 +128,10 @@ struct Texture1 {
 
     __subscript(int2 i) -> float
     {
-        get { return textureHandles1[handle.index][i]; }
+        get { return textureHandles1[handle.index()][i]; }
     }
 
     float3 sampleLevel2D(SamplerState s, float2 uv, float mip) {
-        return textureHandles1[handle.index].SampleLevel(s, uv, mip);
+        return textureHandles1[handle.index()].SampleLevel(s, uv, mip);
     }
 }

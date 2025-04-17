@@ -34,6 +34,7 @@ struct GConst {
     uint proberng;
     float cell_size;
     uint2 mouse;
+    uint2 pad;
 };
 
 struct RayPayload {

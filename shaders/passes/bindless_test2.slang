@@ -49,6 +49,7 @@ const static float3 vertices[] = {
 Out vertex(uint vertexid: SV_VertexID) {
     let g_Const = loadConstants<GConst>();
     Out out;
+
     float4 worldPosition = float4(vertices[vertexid], 1.0);
     float4 viewPosition = mul(g_Const.view, worldPosition);
     out.position = mul(g_Const.proj, viewPosition);

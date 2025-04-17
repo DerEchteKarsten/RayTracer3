@@ -26,7 +26,7 @@ impl ComputePipelineHandle {
         let pipeline = PipelineCache::get_compute_pipeline(self);
         unsafe {
             ctx.device
-                .cmd_bind_pipeline(*cmd, vk::PipelineBindPoint::COMPUTE, *pipeline);
+                .cmd_bind_pipeline(*cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             ctx.device.cmd_dispatch(*cmd, x, y, z);
         }
     }
@@ -67,10 +67,14 @@ pub struct RasterPipelineHandle {
     pub mesh_entry: String,
     pub fragment_path: String,
     pub fragment_entry: String,
+}
 
-    pub color_formats: Vec<vk::Format>,
-    pub depth_format: vk::Format,
-    pub stencil_format: vk::Format,
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct RasterPipelineHash {
+    handle: RasterPipelineHandle,
+    color_formats: Vec<vk::Format>,
+    depth_format: vk::Format,
+    stencil_format: vk::Format,
 }
 
 impl RasterPipelineHandle {
@@ -86,8 +90,12 @@ impl RasterPipelineHandle {
         y: u32,
         z: u32,
     ) {
+        let color_formats = color_attachments.iter().map(|e| e.format).collect::<Vec<_>>();
+        let depth_format = depth_attachment.and_then(|d| Some(d.format)).unwrap_or(vk::Format::UNDEFINED);
+        let stencil_format = stencil_attachment.and_then(|d| Some(d.format)).unwrap_or(vk::Format::UNDEFINED);
+
         let ctx = Context::get();
-        let pipeline = PipelineCache::get_raster_pipeline(self);
+        let pipeline = PipelineCache::get_raster_pipeline(self, color_formats, depth_format, stencil_format);
 
         let color_attachments = color_attachments
             .iter()
@@ -149,7 +157,7 @@ impl RasterPipelineHandle {
         unsafe {
             ctx.device.cmd_begin_rendering(cmd, &rendering_info);
             ctx.device
-                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, *pipeline);
+                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
 
             ctx.device.cmd_set_viewport(
                 cmd,
@@ -183,7 +191,7 @@ impl RasterPipelineHandle {
 
 pub(crate) struct PipelineCache {
     compute_pipelines: HashMap<ComputePipelineHandle, vk::Pipeline>,
-    raster_pipelines: HashMap<RasterPipelineHandle, vk::Pipeline>,
+    raster_pipelines: HashMap<RasterPipelineHash, vk::Pipeline>,
     raytracing_pipelines: HashMap<RayTracingPipelineHandle, (vk::Pipeline, ShaderBindingTable)>,
     shader_cache: HashMap<String, vk::ShaderModule>,
 }
@@ -246,10 +254,10 @@ impl PipelineCache {
         }
     }
 
-    pub fn get_compute_pipeline<'a>(handle: &ComputePipelineHandle) -> &'a vk::Pipeline {
+    pub fn get_compute_pipeline(handle: &ComputePipelineHandle) -> vk::Pipeline {
         let s = Self::get_mut();
         match s.compute_pipelines.get(handle) {
-            Some(pipeline) => pipeline,
+            Some(pipeline) => pipeline.clone(),
             None => {
                 let entry = format!("{}\0", handle.entry);
                 let path = format!("./shaders/bin/{}.slang.spv", handle.path);
@@ -270,8 +278,8 @@ impl PipelineCache {
                 ctx.set_debug_name(&handle.path, pipeline);
                 Self::get_mut()
                     .compute_pipelines
-                    .insert(handle.clone(), pipeline);
-                Self::get().compute_pipelines.get(handle).unwrap()
+                    .insert(handle.clone(), pipeline.clone());
+                pipeline
             }
         }
     }
@@ -323,10 +331,11 @@ impl PipelineCache {
         }
     }
 
-    pub fn get_raster_pipeline(handle: &RasterPipelineHandle) -> &vk::Pipeline {
+    pub fn get_raster_pipeline(handle: &RasterPipelineHandle, color_formats: Vec<vk::Format>, depth_format: vk::Format, stencil_format: vk::Format) -> vk::Pipeline {
         let s = Self::get_mut();
-        match s.raster_pipelines.get(handle) {
-            Some(pipeline) => pipeline,
+        let hash = RasterPipelineHash {handle: handle.clone(), color_formats, depth_format, stencil_format};
+        match s.raster_pipelines.get(&hash) {
+            Some(pipeline) => pipeline.clone(),
             None => {
                 let fragment_entry = format!("{}\0", handle.fragment_entry);
                 let fragment_path = format!("./shaders/bin/{}.slang.spv", handle.fragment_path);
@@ -336,9 +345,9 @@ impl PipelineCache {
                 let ctx = Context::get();
 
                 let mut rendering = vk::PipelineRenderingCreateInfo::default()
-                    .color_attachment_formats(handle.color_formats.as_slice())
-                    .depth_attachment_format(handle.depth_format)
-                    .stencil_attachment_format(handle.stencil_format)
+                    .color_attachment_formats(&hash.color_formats)
+                    .depth_attachment_format(depth_format)
+                    .stencil_attachment_format(stencil_format)
                     .view_mask(0);
 
                 let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
@@ -352,7 +361,7 @@ impl PipelineCache {
                     .alpha_to_one_enable(false)
                     .sample_mask(&[]);
 
-                let color_blend_attachments = handle
+                let color_blend_attachments = hash
                     .color_formats
                     .iter()
                     .map(|e| {
@@ -432,8 +441,8 @@ impl PipelineCache {
 
                 Self::get_mut()
                     .raster_pipelines
-                    .insert(handle.clone(), pipeline);
-                Self::get().raster_pipelines.get(handle).unwrap()
+                    .insert(hash, pipeline.clone());
+                pipeline
             }
         }
     }

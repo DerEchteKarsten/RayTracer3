@@ -185,7 +185,7 @@ impl Swapchain {
             .wait_semaphores(&binding);
         unsafe {
             self.ash_swapchain
-                .queue_present(ctx.graphics_queue, &present_info)
+                .queue_present(ctx.present_queue, &present_info)
                 .unwrap()
         };
     }
