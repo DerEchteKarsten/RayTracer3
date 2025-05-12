@@ -1,4 +1,7 @@
-use std::{collections::{HashMap, HashSet}, ffi::c_void};
+use std::{
+    collections::{HashMap, HashSet},
+    ffi::c_void,
+};
 
 use anyhow::Result;
 use ash::vk::{self, Format, ImageUsageFlags};
@@ -15,7 +18,7 @@ use super::{
     bindless::{BindlessDescriptorHeap, DescriptorResourceHandle},
     vulkan::{
         buffer::{Buffer, BufferHandle},
-        image::{Image, ImageHandle},
+        image::{Image, ImageHandle, ImageType},
         swapchain::{Swapchain, FRAMES_IN_FLIGHT},
         Context,
     },
@@ -27,8 +30,7 @@ pub mod build;
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
 pub struct ResourceHandle(u32);
 
-pub const IMPORTED: NodeHandle = "";
-
+pub const IMPORTED: NodeHandle = !0;
 
 #[derive(PartialEq, Eq)]
 enum ResourceType {
@@ -52,13 +54,74 @@ impl ResourceType {
     }
 }
 
+#[derive(Debug)]
+struct Barrier {
+    resource: ResourceHandle,
+    layout: vk::ImageLayout,
+    access: vk::AccessFlags2,
+    stages: vk::PipelineStageFlags2,
+}
+
+impl Barrier {
+    fn need_invalidate(&self, event: &Event) -> bool {
+        (0..64)
+            .map(|i| {
+                self.access.contains(
+                    event.invalidated_in_stage[((self.stages.as_raw() >> i) & 1) as usize / 2],
+                )
+            })
+            .fold(false, |acc, a| acc || a)
+    }
+}
+
+impl Barrier {
+    fn new(resource: ResourceHandle) -> Self {
+        Self {
+            resource,
+            layout: vk::ImageLayout::UNDEFINED,
+            access: vk::AccessFlags2::empty(),
+            stages: vk::PipelineStageFlags2::empty(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Barriers {
+    invalidates: Vec<Barrier>,
+    flushes: Vec<Barrier>,
+}
+
 #[derive(PartialEq, Eq)]
 struct Resource {
+    event: Event,
     descriptor: DescriptorResourceHandle,
     ty: ResourceType,
 }
 
-type NodeHandle = &'static str;
+impl Resource {
+    fn new(descriptor: DescriptorResourceHandle, ty: ResourceType) -> Self {
+        // let event = unsafe {
+        //     Context::get()
+        //         .device
+        //         .create_event(&vk::EventCreateInfo::default(), None)
+        //         .unwrap()
+        // };
+        // Context::get().set_debug_name(&format!("EventFor{}", descriptor.index()), event);
+        Self {
+            descriptor,
+            ty,
+            event: Event {
+                // event,
+                invalidated_in_stage: [vk::AccessFlags2::empty(); 25],
+                pipeline_barrier_src_stages: vk::PipelineStageFlags2::empty(),
+                to_flush: vk::AccessFlags2::default(),
+                layout: vk::ImageLayout::UNDEFINED,
+            },
+        }
+    }
+}
+
+type NodeHandle = usize;
 
 #[enum_dispatch]
 pub trait ExecutionTrait {
@@ -76,6 +139,7 @@ enum Execution {
 
 #[derive(PartialEq)]
 struct Node {
+    name: &'static str,
     execution: Execution,
     constant_offset: Option<u32>,
     edges: Vec<NodeEdge>,
@@ -93,23 +157,153 @@ impl Node {
         &'b self,
     ) -> std::iter::Filter<std::slice::Iter<'b, NodeEdge>, impl FnMut(&&'b NodeEdge) -> bool> {
         self.edges.iter().filter(|e| {
-            e.edge_type != EdgeType::ColorAttachment
+            e.edge_type != EdgeType::ColorAttachmentOutput
                 && e.edge_type != EdgeType::DepthAttachment
                 && e.edge_type != EdgeType::StencilAttachment
         })
     }
+
+    fn cmd_push_constants(&self, rg: &RenderGraph, frame: &FrameData, descriptor_offset: u32) {
+        let ctx = Context::get();
+        unsafe {
+            let mut constants = [0u8; 16];
+            constants[0..4].copy_from_slice(&self.constant_offset.unwrap_or(0).to_ne_bytes());
+
+            constants[4..8].copy_from_slice(
+                &if self.bindings().count() == 0 {
+                    0
+                } else {
+                    descriptor_offset
+                }
+                .to_ne_bytes(),
+            );
+            constants[8..12]
+                .copy_from_slice(&rg.descriptor_buffer.descriptor.0.to_ne_bytes());
+            constants[12..16]
+                .copy_from_slice(&rg.constants_buffer.descriptor.0.to_ne_bytes());
+
+            ctx.device.cmd_push_constants(
+                frame.cmd,
+                BindlessDescriptorHeap::get().layout,
+                vk::ShaderStageFlags::ALL,
+                0,
+                &constants,
+            )
+        };
+    }
+
+    fn get_barriers(&self, rg: &RenderGraph) -> Barriers {
+        let mut invalidates: HashMap<ResourceHandle, Barrier> = HashMap::new();
+        let mut flushes: HashMap<ResourceHandle, Barrier> = HashMap::new();
+
+        for edge in &self.edges {
+            match edge.edge_type {
+                EdgeType::ShaderRead => {
+                    let barrier = invalidates
+                        .entry(edge.resource)
+                        .or_insert(Barrier::new(edge.resource));
+                    barrier.stages |= self.execution.get_stages();
+                    if let Some(image) = rg.image_handle(edge.resource)
+                        && image.usage.contains(vk::ImageUsageFlags::STORAGE)
+                    {
+                        barrier.access |= vk::AccessFlags2::SHADER_STORAGE_READ;
+                        barrier.layout = vk::ImageLayout::GENERAL;
+                    } else {
+                        barrier.access |= vk::AccessFlags2::SHADER_SAMPLED_READ;
+                        barrier.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+                    }
+                }
+                EdgeType::ColorAttachmentOutput => {
+                    let barrier = flushes
+                        .entry(edge.resource)
+                        .or_insert(Barrier::new(edge.resource));
+                    barrier.access |= vk::AccessFlags2::COLOR_ATTACHMENT_WRITE;
+                    barrier.stages |= vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT;
+                    barrier.layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+                }
+                EdgeType::DepthAttachment | EdgeType::StencilAttachment => {
+                    let src = flushes
+                        .entry(edge.resource)
+                        .or_insert(Barrier::new(edge.resource));
+                    let dst = invalidates
+                        .entry(edge.resource)
+                        .or_insert(Barrier::new(edge.resource));
+                    dst.layout = vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                    dst.access |= vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                        | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE;
+                    dst.stages |= vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS;
+
+                    src.layout = vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                    src.access |= vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE;
+                    dst.stages |= vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS;
+                }
+                EdgeType::ShaderReadWrite => {
+                    let flush = flushes
+                        .entry(edge.resource)
+                        .or_insert(Barrier::new(edge.resource));
+                    flush.stages |= self.execution.get_stages();
+                    flush.access |= vk::AccessFlags2::SHADER_STORAGE_WRITE;
+                    flush.layout = vk::ImageLayout::GENERAL;
+
+                    let invalidate = invalidates
+                        .entry(edge.resource)
+                        .or_insert(Barrier::new(edge.resource));
+                    invalidate.stages |= self.execution.get_stages();
+                    if let Some(image) = rg.image_handle(edge.resource)
+                        && image.usage.contains(vk::ImageUsageFlags::STORAGE)
+                    {
+                        invalidate.access |= vk::AccessFlags2::SHADER_STORAGE_READ;
+                        invalidate.layout = vk::ImageLayout::GENERAL;
+                    } else {
+                        invalidate.access |= vk::AccessFlags2::SHADER_SAMPLED_READ;
+                        invalidate.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+                    }
+                }
+                EdgeType::ShaderWrite => {
+                    let flush = flushes
+                        .entry(edge.resource)
+                        .or_insert(Barrier::new(edge.resource));
+                    flush.stages |= self.execution.get_stages();
+                    flush.access |= vk::AccessFlags2::SHADER_STORAGE_WRITE;
+                    flush.layout = vk::ImageLayout::GENERAL;
+
+                    if !invalidates.contains_key(&edge.resource) && rg.swapchain_images[rg.swapchain_image_index] == flush.resource {
+                        invalidates.insert(
+                            edge.resource,
+                            Barrier {
+                                resource: edge.resource,
+                                layout: vk::ImageLayout::GENERAL,
+                                access: vk::AccessFlags2::NONE,
+                                stages: self.execution.get_stages(),
+                            },
+                        );
+                    }
+                }
+                EdgeType::TransferDst => {
+                    todo!();
+                }
+                EdgeType::TransferSrc => {
+                    todo!();
+                }
+            }
+        }
+
+        Barriers {
+            invalidates: invalidates.into_values().collect::<Vec<_>>(),
+            flushes: flushes.into_values().collect::<Vec<_>>(),
+        }
+    }
 }
 
-pub fn depends_on(s: NodeHandle, rg: &RenderGraph, other: NodeHandle) -> bool {
+pub fn depends_on(rg: &RenderGraph, other: NodeHandle, s: NodeHandle) -> bool {
     other == s
         || rg.nodes[other]
             .edges
             .iter()
             .find(|e| {
                 if let Some(origin) = e.origin
-                    && origin == other
-                    && (e.edge_type == EdgeType::ShaderRead
-                        || e.edge_type == EdgeType::ShaderReadWrite)
+                    && origin == s
                 {
                     true
                 } else {
@@ -119,12 +313,20 @@ pub fn depends_on(s: NodeHandle, rg: &RenderGraph, other: NodeHandle) -> bool {
             .is_some()
 }
 
-
 #[derive(Clone)]
 struct FrameData {
     command_pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     frame_number: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Event {
+    // event: vk::Event,
+    pipeline_barrier_src_stages: vk::PipelineStageFlags2,
+    to_flush: vk::AccessFlags2,
+    invalidated_in_stage: [vk::AccessFlags2; 25],
+    layout: vk::ImageLayout,
 }
 
 pub struct RenderGraph {
@@ -133,8 +335,7 @@ pub struct RenderGraph {
     constants_buffer: Resource,
     descriptor_buffer: Resource,
 
-    graph: HashSet<NodeHandle>,
-    nodes: HashMap<NodeHandle, Node>,
+    nodes: Vec<Node>,
     constants: Vec<(*const c_void, usize)>,
 
     frame_data: [FrameData; FRAMES_IN_FLIGHT],
@@ -145,47 +346,23 @@ pub struct RenderGraph {
     pub frame_number: u64,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum EdgeType {
     ShaderRead,
     ShaderReadWrite,
     ShaderWrite,
-    ColorAttachment,
+    ColorAttachmentOutput,
     DepthAttachment,
     StencilAttachment,
     TransferSrc,
     TransferDst,
 }
 
-impl EdgeType {
-    pub fn access_flags(&self) -> vk::AccessFlags2 {
-        match self {
-            EdgeType::ShaderRead => vk::AccessFlags2::SHADER_READ,
-            EdgeType::ShaderReadWrite => {
-                vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE
-            }
-            EdgeType::ShaderWrite => vk::AccessFlags2::SHADER_WRITE,
-            EdgeType::ColorAttachment => vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            EdgeType::DepthAttachment => {
-                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
-            }
-            EdgeType::StencilAttachment => {
-                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
-            }
-            EdgeType::TransferSrc => vk::AccessFlags2::TRANSFER_READ,
-            EdgeType::TransferDst => vk::AccessFlags2::TRANSFER_WRITE,
-        }
-    }
-}
-
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct NodeEdge {
     edge_type: EdgeType,
     origin: Option<NodeHandle>,
     resource: ResourceHandle,
-    layout: Option<vk::ImageLayout>,
 }
 
 trait Importable {
@@ -195,50 +372,44 @@ trait Importable {
 impl Importable for Buffer {
     fn resource(self) -> Resource {
         let descriptor = BindlessDescriptorHeap::get_mut().allocate_buffer_handle(&self);
-        Resource {
-            descriptor: descriptor,
-            ty: ResourceType::Buffer(self),
-        }
+        Resource::new(descriptor, ResourceType::Buffer(self))
     }
 }
 impl Importable for BufferHandle {
     fn resource(self) -> Resource {
         let descriptor = BindlessDescriptorHeap::get_mut().allocate_buffer_handle(&self);
-        Resource {
-            descriptor: descriptor,
-            ty: ResourceType::Buffer(Buffer {
+        Resource::new(
+            descriptor,
+            ResourceType::Buffer(Buffer {
                 address: self.address,
                 allocation: None,
                 buffer: self.buffer,
                 size: self.size,
                 usage: self.usage,
             }),
-        }
+        )
     }
 }
 impl Importable for Image {
     fn resource(self) -> Resource {
         let descriptor = if self.usage.contains(vk::ImageUsageFlags::STORAGE) {
             BindlessDescriptorHeap::get_mut().allocate_image_handle(&self)
-        }else {
+        } else {
             BindlessDescriptorHeap::get_mut().allocate_texture_handle(&self)
         };
-        Resource {
-            descriptor: descriptor,
-            ty: ResourceType::Image(self),
-        }
+        Resource::new(descriptor, ResourceType::Image(self))
     }
 }
 impl Importable for ImageHandle {
     fn resource(self) -> Resource {
         let descriptor = if self.usage.contains(vk::ImageUsageFlags::STORAGE) {
             BindlessDescriptorHeap::get_mut().allocate_image_handle(&self)
-        }else {
+        } else {
             BindlessDescriptorHeap::get_mut().allocate_texture_handle(&self)
         };
-        Resource {
-            descriptor: descriptor,
-            ty: ResourceType::Image(Image {
+        Resource::new(
+            descriptor,
+            ResourceType::Image(Image {
                 allocation: None,
                 extent: self.extent,
                 format: self.format,
@@ -246,15 +417,12 @@ impl Importable for ImageHandle {
                 usage: self.usage,
                 view: self.view,
             }),
-        }
+        )
     }
 }
 impl Importable for DescriptorResourceHandle {
     fn resource(self) -> Resource {
-        Resource {
-            descriptor: self,
-            ty: ResourceType::ExternalDescriptor,
-        }
+        Resource::new(self, ResourceType::ExternalDescriptor)
     }
 }
 
@@ -303,10 +471,10 @@ impl RenderGraph {
             .map(|image| {
                 let descriptor = BindlessDescriptorHeap::get_mut().allocate_image_handle(image);
                 let index = resources.len();
-                resources.push(Resource {
+                resources.push(Resource::new(
                     descriptor,
-                    ty: ResourceType::Image(image.clone()),
-                });
+                    ResourceType::Image(image.clone()),
+                ));
                 ResourceHandle(index as u32)
             })
             .collect::<Vec<_>>();
@@ -318,10 +486,7 @@ impl RenderGraph {
             )
             .unwrap();
             let descriptor = BindlessDescriptorHeap::get_mut().allocate_buffer_handle(&buffer);
-            Resource {
-                descriptor,
-                ty: ResourceType::Buffer(buffer),
-            }
+            Resource::new(descriptor, ResourceType::Buffer(buffer))
         };
 
         let constants_buffer = {
@@ -332,16 +497,12 @@ impl RenderGraph {
             )
             .unwrap();
             let descriptor = BindlessDescriptorHeap::get_mut().allocate_buffer_handle(&buffer);
-            Resource {
-                descriptor,
-                ty: ResourceType::Buffer(buffer),
-            }
+            Resource::new(descriptor, ResourceType::Buffer(buffer))
         };
 
         Self {
             constants: Vec::new(),
-            graph: HashSet::new(),
-            nodes: HashMap::new(),
+            nodes: Vec::new(),
             swapchain,
             frame_data,
             frame_number: 0,
@@ -358,15 +519,18 @@ impl RenderGraph {
         self.swapchain_images[self.swapchain_image_index]
     }
 
-    fn import<T>(&mut self, value: T) -> ResourceHandle 
-    where T: Importable {
+    fn import<T>(&mut self, value: T) -> ResourceHandle
+    where
+        T: Importable,
+    {
         let index = self.resources.len();
         self.resources.push(value.resource());
         ResourceHandle(index as u32)
     }
 
-    pub fn buffer(&mut self, size: u64, usage: vk::BufferUsageFlags) -> ResourceHandle {
+    pub fn buffer(&mut self, size: u64, usage: vk::BufferUsageFlags, name: &str) -> ResourceHandle {
         let buffer = Buffer::new(usage, MemoryLocation::GpuOnly, size).unwrap();
+        Context::get().set_debug_name(name, buffer.buffer);
         self.import(buffer)
     }
 
@@ -375,9 +539,11 @@ impl RenderGraph {
         size: ImageSize,
         usage: vk::ImageUsageFlags,
         format: Format,
+        name: &str,
     ) -> ResourceHandle {
         let size = size.size();
         let image = Image::new_2d(usage, MemoryLocation::GpuOnly, format, size.x, size.y).unwrap();
+        Context::get().set_debug_name(name, image.image);
         self.import(image)
     }
 

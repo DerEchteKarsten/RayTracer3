@@ -371,4 +371,40 @@ impl Context {
             .object_name(name);
         unsafe { self.debug_utils.set_debug_utils_object_name(&name_info) }.unwrap();
     }
+
+    pub(crate) fn cmd_start_label(&self, cmd: &vk::CommandBuffer, name: &str) {
+        let name = format!("{}\0", name);
+        let name = CStr::from_bytes_with_nul(name.as_bytes()).unwrap();
+        let name_info = vk::DebugUtilsLabelEXT::default().label_name(name);
+        unsafe {
+            self.debug_utils
+                .cmd_begin_debug_utils_label(*cmd, &name_info)
+        };
+    }
+    pub(crate) fn cmd_insert_label(&self, cmd: &vk::CommandBuffer, name: &str) {
+        let name = format!("{}\0", name);
+        let name = CStr::from_bytes_with_nul(name.as_bytes()).unwrap();
+        let name_info = vk::DebugUtilsLabelEXT::default().label_name(name);
+        unsafe {
+            self.debug_utils
+                .cmd_insert_debug_utils_label(*cmd, &name_info)
+        };
+    }
+    pub(crate) fn cmd_end_label(&self, cmd: &vk::CommandBuffer) {
+        unsafe { self.debug_utils.cmd_end_debug_utils_label(*cmd) };
+    }
+
+    pub(crate) fn submit(&self, cmd: &vk::CommandBuffer, wait_semaphores: &[vk::SemaphoreSubmitInfo<'_>], signal_semaphores: &[vk::SemaphoreSubmitInfo<'_>]) {
+        let command_buffers = [vk::CommandBufferSubmitInfo::default().command_buffer(*cmd)];
+
+        let submit = vk::SubmitInfo2::default()
+            .command_buffer_infos(&command_buffers)
+            .signal_semaphore_infos(signal_semaphores)
+            .wait_semaphore_infos(wait_semaphores);
+        unsafe {
+            self.device
+                .queue_submit2(self.graphics_queue, &[submit], vk::Fence::null())
+                .unwrap()
+        };
+    } 
 }

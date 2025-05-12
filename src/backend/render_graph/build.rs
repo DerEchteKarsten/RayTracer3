@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 
@@ -20,8 +20,8 @@ use crate::{GConst, WINDOW_SIZE};
 use derivative::Derivative;
 
 use super::{
-    EdgeType, Execution, ExecutionTrait, Node, NodeEdge, NodeHandle, RenderGraph,
-    ResourceHandle, IMPORTED,
+    EdgeType, Execution, ExecutionTrait, Node, NodeEdge, NodeHandle, RenderGraph, ResourceHandle,
+    IMPORTED,
 };
 
 use std::ffi::{self, c_void};
@@ -43,7 +43,13 @@ where
     T: ExecutionTrait + 'static,
     Execution: From<T>,
 {
-    fn new<E: ExecutionTrait + 'static>(rg: &'b mut RenderGraph, name: &'static str) -> NodeBuilder<'b, E> {
+    fn new<E: ExecutionTrait + 'static>(
+        rg: &'b mut RenderGraph,
+        name: &'static str,
+    ) -> NodeBuilder<'b, E> {
+        if rg.nodes.iter().find(|e| e.name == name).is_some() {
+            panic!("Node name {name} allready used")
+        }
         NodeBuilder::<'b, E> {
             name,
             rg,
@@ -74,13 +80,6 @@ where
         }
         let image_handle = self.rg.image_handle(handle);
         self.edges.push(NodeEdge {
-            layout: image_handle.and_then(|image| {
-                Some(if image.usage.contains(vk::ImageUsageFlags::STORAGE) {
-                    vk::ImageLayout::GENERAL
-                } else {
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-                })
-            }),
             origin: if origin == IMPORTED {
                 None
             } else {
@@ -94,7 +93,6 @@ where
 
     pub fn write(mut self, last_read: NodeHandle, handle: ResourceHandle) -> Self {
         self.edges.push(NodeEdge {
-            layout: Some(vk::ImageLayout::GENERAL),
             origin: if last_read == IMPORTED {
                 None
             } else {
@@ -108,7 +106,6 @@ where
 
     pub fn read_write(mut self, origin: NodeHandle, handle: ResourceHandle) -> Self {
         self.edges.push(NodeEdge {
-            layout: Some(vk::ImageLayout::GENERAL),
             origin: if origin == IMPORTED {
                 None
             } else {
@@ -120,30 +117,29 @@ where
         self
     }
     fn build(self) -> NodeHandle {
-        let offset = if let Some(constants) = self.constants {
-            if let Some(found_constants) = self
-                .rg
-                .constants
-                .iter()
-                .position(|co| co.0 == constants)
-            {
-                let offset: usize = self
-                    .rg
-                    .constants[..found_constants]
-                    .iter()
-                    .map(|c| c.1)
-                    .sum();
-                Some(offset as u32)
-            } else {
-                let offset = self
-                    .rg
-                    .constants
-                    .iter()
-                    .map(|c| c.1)
-                    .sum();
-                self.rg.constants.push((constants.clone(), self.constants_size));
+        let mut seen = HashSet::new();
+        if let Some(edge) = self
+            .edges
+            .iter()
+            .find(|x| !seen.insert(x.resource.clone()))
+        {
+            panic!("resource: {:?} is duplicate", edge.resource);
+        }
 
-                let buffer_ptr = self.rg.constants_buffer
+        let offset = if let Some(constants) = self.constants {
+            let offset = if let Some(found_constants) = self.rg.constants.iter().position(|co| co.0 == constants){
+                self.rg.constants[..found_constants]
+                    .iter()
+                    .map(|c| c.1)
+                    .sum()
+            } else {
+                let offset = self.rg.constants.iter().map(|c| c.1).sum();
+                self.rg
+                    .constants
+                    .push((constants.clone(), self.constants_size));
+                let buffer_ptr = self
+                    .rg
+                    .constants_buffer
                     .ty
                     .buffer()
                     .allocation
@@ -152,27 +148,17 @@ where
                     .mapped_ptr()
                     .unwrap()
                     .as_ptr() as *mut c_void;
-                unsafe {
-                    constants
-                        .copy_to(buffer_ptr.add(offset), self.constants_size)
-                };
-                Some(offset as u32)
-            }
-        }else {
+                unsafe { constants.copy_to(buffer_ptr.add(offset), self.constants_size) };
+                offset
+            };
+            Some(offset as u32)
+        } else {
             None
-        };  
+        };
 
-        match self.rg.nodes.get_mut(self.name) {
-            None => {self.rg.nodes.insert(self.name, Node {
-                constant_offset: offset,
-                edges: self.edges,
-                execution: Execution::from(unsafe { self.execution.assume_init() }),
-            });},
-            Some(node) => {node.edges = self.edges;}
-        }
-
-        self.rg.graph.insert(self.name);
-        self.name
+        let handle = self.rg.nodes.len();
+        self.rg.nodes.push(Node { name: self.name, execution: unsafe { self.execution.assume_init().into() }, constant_offset: offset, edges: self.edges });
+        handle
     }
 }
 
@@ -237,12 +223,15 @@ pub(crate) struct ComputePass {
 }
 
 impl ComputePass {
-    pub(crate) fn new<'a>(rg: &'a mut RenderGraph, name: &'static str) -> NodeBuilder<'a, ComputePass> {
+    pub(crate) fn new<'a>(
+        rg: &'a mut RenderGraph,
+        name: &'static str,
+    ) -> NodeBuilder<'a, ComputePass> {
         let mut builder = NodeBuilder::<ComputePass>::new::<ComputePass>(rg, name);
         builder.execution = MaybeUninit::new(ComputePass {
             pipeline: ComputePipelineHandle {
-                path: "".to_owned(),
-                entry: "main".to_owned(),
+                path: "",
+                entry: "main",
             },
             dispatch: DispatchSize::FullScreen,
         });
@@ -251,12 +240,12 @@ impl ComputePass {
 }
 
 impl<'b> NodeBuilder<'b, ComputePass> {
-    pub(crate) fn shader(mut self, path: &str) -> Self {
-        unsafe { self.execution.assume_init_mut() }.pipeline.path = path.to_string();
+    pub(crate) fn shader(mut self, path: &'static str) -> Self {
+        unsafe { self.execution.assume_init_mut() }.pipeline.path = path;
         self
     }
-    pub(crate) fn entry(mut self, entry: &str) -> Self {
-        unsafe { self.execution.assume_init_mut() }.pipeline.entry = entry.to_string();
+    pub(crate) fn entry(mut self, entry: &'static str) -> Self {
+        unsafe { self.execution.assume_init_mut() }.pipeline.entry = entry;
         self
     }
     pub(crate) fn dispatch(mut self, dispatch: DispatchSize) -> NodeHandle {
@@ -288,16 +277,11 @@ pub enum WorkSize2D {
     FractionalFullScreen(u32, u32),
     X(u32),
     XY(u32, u32),
-    Custom(fn() -> UVec2),
 }
 
 impl WorkSize2D {
     fn size(&self) -> (u32, u32) {
         match self {
-            WorkSize2D::Custom(func) => {
-                let res = func();
-                (res.x, res.y)
-            }
             WorkSize2D::FractionalFullScreen(x, y) => (
                 (WINDOW_SIZE.x as u32).div_ceil(*x),
                 (WINDOW_SIZE.y as u32).div_ceil(*y),
@@ -316,13 +300,16 @@ pub(crate) struct RayTracingPass {
 }
 
 impl RayTracingPass {
-    pub(crate) fn new<'a>(rg: &'a mut RenderGraph, name: &'static str) -> NodeBuilder<'a, RayTracingPass> {
+    pub(crate) fn new<'a>(
+        rg: &'a mut RenderGraph,
+        name: &'static str,
+    ) -> NodeBuilder<'a, RayTracingPass> {
         let mut builder = NodeBuilder::<RayTracingPass>::new::<RayTracingPass>(rg, name);
         builder.execution = MaybeUninit::new(RayTracingPass {
             launch: WorkSize2D::FullScreen,
             pipeline: RayTracingPipelineHandle {
-                path: "".to_string(),
-                entry: "main".to_string(),
+                path: "",
+                entry: "main",
             },
         });
         builder
@@ -330,12 +317,12 @@ impl RayTracingPass {
 }
 
 impl<'b> NodeBuilder<'b, RayTracingPass> {
-    pub(crate) fn shader(mut self, path: &str) -> Self {
-        unsafe { self.execution.assume_init_mut() }.pipeline.path = path.to_string();
+    pub(crate) fn shader(mut self, path: &'static str) -> Self {
+        unsafe { self.execution.assume_init_mut() }.pipeline.path = path;
         self
     }
-    pub(crate) fn entry(mut self, entry: &str) -> Self {
-        unsafe { self.execution.assume_init_mut() }.pipeline.entry = entry.to_string();
+    pub(crate) fn entry(mut self, entry: &'static str) -> Self {
+        unsafe { self.execution.assume_init_mut() }.pipeline.entry = entry;
         self
     }
     pub(crate) fn launch(mut self, launch: WorkSize2D) -> NodeHandle {
@@ -369,7 +356,7 @@ impl ExecutionTrait for RasterPass {
         let color_attachments = edges
             .iter()
             .filter_map(|e| {
-                if e.edge_type == EdgeType::ColorAttachment {
+                if e.edge_type == EdgeType::ColorAttachmentOutput {
                     Some(rg.image_handle(e.resource).unwrap())
                 } else {
                     None
@@ -398,21 +385,24 @@ impl ExecutionTrait for RasterPass {
         Ok(())
     }
     fn get_stages(&self) -> vk::PipelineStageFlags2 {
-        vk::PipelineStageFlags2::ALL_GRAPHICS
+        vk::PipelineStageFlags2::FRAGMENT_SHADER
     }
 }
 
 impl RasterPass {
-    pub(crate) fn new<'a>(rg: &'a mut RenderGraph, name: &'static str) -> NodeBuilder<'a, RasterPass> {
+    pub(crate) fn new<'a>(
+        rg: &'a mut RenderGraph,
+        name: &'static str,
+    ) -> NodeBuilder<'a, RasterPass> {
         let mut builder = NodeBuilder::<RasterPass>::new::<RasterPass>(rg, name);
         builder.execution = MaybeUninit::new(RasterPass {
             dispatch: DispatchSize::FullScreen,
             render_area: WorkSize2D::FullScreen,
             pipeline: RasterPipelineHandle {
-                fragment_entry: "main".to_string(),
-                mesh_entry: "main".to_string(),
-                fragment_path: "".to_string(),
-                mesh_path: "".to_string(),
+                fragment_entry: "main",
+                mesh_entry: "main",
+                fragment_path: "",
+                mesh_path: "",
             },
         });
         builder
@@ -420,28 +410,28 @@ impl RasterPass {
 }
 
 impl<'b> NodeBuilder<'b, RasterPass> {
-    pub(crate) fn mesh_shader(mut self, path: &str) -> Self {
+    pub(crate) fn mesh_shader(mut self, path: &'static str) -> Self {
         unsafe { self.execution.assume_init_mut() }
             .pipeline
-            .mesh_path = path.to_string();
+            .mesh_path = path;
         self
     }
-    pub(crate) fn mesh_entry(mut self, entry: &str) -> Self {
+    pub(crate) fn mesh_entry(mut self, entry: &'static str) -> Self {
         unsafe { self.execution.assume_init_mut() }
             .pipeline
-            .mesh_entry = entry.to_string();
+            .mesh_entry = entry;
         self
     }
-    pub(crate) fn fragment_shader(mut self, path: &str) -> Self {
+    pub(crate) fn fragment_shader(mut self, path: &'static str) -> Self {
         unsafe { self.execution.assume_init_mut() }
             .pipeline
-            .fragment_path = path.to_string();
+            .fragment_path = path;
         self
     }
-    pub(crate) fn fragment_entry(mut self, entry: &str) -> Self {
+    pub(crate) fn fragment_entry(mut self, entry: &'static str) -> Self {
         unsafe { self.execution.assume_init_mut() }
             .pipeline
-            .fragment_entry = entry.to_string();
+            .fragment_entry = entry;
         self
     }
 
@@ -463,20 +453,18 @@ impl<'b> NodeBuilder<'b, RasterPass> {
         handle: ResourceHandle,
     ) -> Self {
         self.edges.push(NodeEdge {
-            layout: Some(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
             origin: if last_read == IMPORTED {
                 None
             } else {
                 Some(last_read)
             },
-            edge_type: EdgeType::ColorAttachment,
+            edge_type: EdgeType::ColorAttachmentOutput,
             resource: handle,
         });
         self
     }
     pub(crate) fn depth_attachment(mut self, origin: NodeHandle, handle: ResourceHandle) -> Self {
         self.edges.push(NodeEdge {
-            layout: Some(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL),
             origin: if origin == IMPORTED {
                 None
             } else {
@@ -489,7 +477,6 @@ impl<'b> NodeBuilder<'b, RasterPass> {
     }
     pub(crate) fn stencil_attachment(mut self, origin: NodeHandle, handle: ResourceHandle) -> Self {
         self.edges.push(NodeEdge {
-            layout: Some(vk::ImageLayout::STENCIL_ATTACHMENT_OPTIMAL),
             origin: if origin == IMPORTED {
                 None
             } else {

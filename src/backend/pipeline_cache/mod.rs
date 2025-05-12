@@ -16,8 +16,8 @@ use super::{
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 pub struct ComputePipelineHandle {
-    pub path: String,
-    pub entry: String,
+    pub path: &'static str,
+    pub entry: &'static str,
 }
 
 impl ComputePipelineHandle {
@@ -34,8 +34,8 @@ impl ComputePipelineHandle {
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 pub struct RayTracingPipelineHandle {
-    pub path: String,
-    pub entry: String,
+    pub path: &'static str,
+    pub entry: &'static str,
 }
 
 impl RayTracingPipelineHandle {
@@ -63,10 +63,10 @@ impl RayTracingPipelineHandle {
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 pub struct RasterPipelineHandle {
-    pub mesh_path: String,
-    pub mesh_entry: String,
-    pub fragment_path: String,
-    pub fragment_entry: String,
+    pub mesh_path: &'static str,
+    pub mesh_entry: &'static str,
+    pub fragment_path: &'static str,
+    pub fragment_entry: &'static str,
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -90,12 +90,20 @@ impl RasterPipelineHandle {
         y: u32,
         z: u32,
     ) {
-        let color_formats = color_attachments.iter().map(|e| e.format).collect::<Vec<_>>();
-        let depth_format = depth_attachment.and_then(|d| Some(d.format)).unwrap_or(vk::Format::UNDEFINED);
-        let stencil_format = stencil_attachment.and_then(|d| Some(d.format)).unwrap_or(vk::Format::UNDEFINED);
+        let color_formats = color_attachments
+            .iter()
+            .map(|e| e.format)
+            .collect::<Vec<_>>();
+        let depth_format = depth_attachment
+            .and_then(|d| Some(d.format))
+            .unwrap_or(vk::Format::UNDEFINED);
+        let stencil_format = stencil_attachment
+            .and_then(|d| Some(d.format))
+            .unwrap_or(vk::Format::UNDEFINED);
 
         let ctx = Context::get();
-        let pipeline = PipelineCache::get_raster_pipeline(self, color_formats, depth_format, stencil_format);
+        let pipeline =
+            PipelineCache::get_raster_pipeline(self, color_formats, depth_format, stencil_format);
 
         let color_attachments = color_attachments
             .iter()
@@ -331,9 +339,19 @@ impl PipelineCache {
         }
     }
 
-    pub fn get_raster_pipeline(handle: &RasterPipelineHandle, color_formats: Vec<vk::Format>, depth_format: vk::Format, stencil_format: vk::Format) -> vk::Pipeline {
+    pub fn get_raster_pipeline(
+        handle: &RasterPipelineHandle,
+        color_formats: Vec<vk::Format>,
+        depth_format: vk::Format,
+        stencil_format: vk::Format,
+    ) -> vk::Pipeline {
         let s = Self::get_mut();
-        let hash = RasterPipelineHash {handle: handle.clone(), color_formats, depth_format, stencil_format};
+        let hash = RasterPipelineHash {
+            handle: handle.clone(),
+            color_formats,
+            depth_format,
+            stencil_format,
+        };
         match s.raster_pipelines.get(&hash) {
             Some(pipeline) => pipeline.clone(),
             None => {

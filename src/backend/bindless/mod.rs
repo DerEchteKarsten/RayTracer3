@@ -36,7 +36,7 @@ impl ImmutableSampler {
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 #[repr(C)]
-pub struct DescriptorResourceHandle(u32);
+pub struct DescriptorResourceHandle(pub u32);
 
 enum AccessType {
     ReadOnly,

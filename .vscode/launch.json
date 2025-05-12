@@ -5,41 +5,14 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "type": "lldb",
+            "type": "lldb-dap",
             "request": "launch",
-            "name": "Debug executable 'RayTracer3'",
-            "cargo": {
-                "args": [
-                    "build",
-                    "--bin=RayTracer3",
-                    "--package=RayTracer3"
-                ],
-                "filter": {
-                    "name": "RayTracer3",
-                    "kind": "bin"
-                }
-            },
+            "name": "Launch",
+            "program": "${workspaceRoot}/target/debug/RayTracer3",
             "args": [],
-            "cwd": "${workspaceFolder}"
-        },
-        {
-            "type": "lldb",
-            "request": "launch",
-            "name": "Debug unit tests in executable 'RayTracer3'",
-            "cargo": {
-                "args": [
-                    "test",
-                    "--no-run",
-                    "--bin=RayTracer3",
-                    "--package=RayTracer3"
-                ],
-                "filter": {
-                    "name": "RayTracer3",
-                    "kind": "bin"
-                }
-            },
-            "args": [],
-            "cwd": "${workspaceFolder}"
+            "env": [],
+            "cwd": "${workspaceRoot}"
         }
+        
     ]
 }

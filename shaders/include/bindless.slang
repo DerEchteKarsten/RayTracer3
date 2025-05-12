@@ -6,7 +6,6 @@ struct Offsets {
     uint32_t bindings;
     RenderResourceHandle bindings_buffer;
     RenderResourceHandle constants_buffer;
-
 }
 [[vk::push_constant]] ConstantBuffer<Offsets> g_offsets;
 
@@ -29,13 +28,13 @@ enum RenderResourceTag {
 
 //TODO Validation
 T loadBindings<T>() {
-    #ifdef DEBUG
-        if(g_offsets.bindings_buffer.tag() != RenderResourceTag::Buffer) {
-            printf("Bindings Buffer is not a Buffer! is %i insted", g_offsets.bindings_buffer.tag());
-            T t;
-            return t;
-        }
-    #endif
+    // #ifdef DEBUG
+    //     if(g_offsets.bindings_buffer.tag() != RenderResourceTag::Buffer) {
+    //         printf("Bindings Buffer is not a Buffer! is %i insted", g_offsets.bindings_buffer.tag());
+    //         T t;
+    //         return t;
+    //     }
+    // #endif
     return bufferHandles[g_offsets.bindings_buffer.index()].Load<T>(g_offsets.bindings);
 }
 

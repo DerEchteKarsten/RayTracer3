@@ -4,6 +4,7 @@
 #![feature(box_as_ptr)]
 #![feature(int_roundings)]
 #![feature(rustc_private)]
+#![feature(map_try_insert)]
 pub mod assets;
 pub mod backend;
 pub mod imgui;
@@ -205,15 +206,18 @@ fn main() {
     // let tlas = rg.import_tlas(&tlas);
     // let vertecies = rg.import_buffer(&model.vertex_buffer.handle());
     // let indicies = rg.import_buffer(&model.index_buffer.handle());
+
     let depth = rg.image(
         ImageSize::FullScreen,
         ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | ImageUsageFlags::SAMPLED,
         Format::D32_SFLOAT,
+        "Depth"
     );
     let color = rg.image(
         ImageSize::FullScreen,
         ImageUsageFlags::COLOR_ATTACHMENT | ImageUsageFlags::SAMPLED,
         Format::R8G8B8A8_SRGB,
+        "Color"
     );
 
     let mut frame_time = Duration::default();
@@ -264,24 +268,62 @@ fn main() {
                         rg.begin_frame();
 
                         let swapchain = rg.get_swapchain();
-                        let test2 = RasterPass::new(&mut rg)
-                            .fragment_shader("bindless_test2")
-                            .mesh_shader("bindless_test2")
-                            .fragment_entry("fragment")
-                            .mesh_entry("vertex")
-                            .constants(&gconst)
-                            .depth_attachment(IMPORTED, depth)
-                            .color_attachment(IMPORTED, color)
-                            .render_area(WorkSize2D::FullScreen)
-                            .draw(DispatchSize::X(1));
+                        // let test2 = RasterPass::new(&mut rg, "test2")
+                        //     .fragment_shader("bindless_test2")
+                        //     .mesh_shader("bindless_test2")
+                        //     .fragment_entry("fragment")
+                        //     .mesh_entry("vertex")
+                        //     .constants(&gconst)
+                        //     .depth_attachment(IMPORTED, depth)
+                        //     .color_attachment(IMPORTED, color)
+                        //     .render_area(WorkSize2D::FullScreen)
+                        //     .draw(DispatchSize::X(1));
 
-                        let test = ComputePass::new(&mut rg)
+                        // let test = ComputePass::new(&mut rg, "test")
+                        //     .shader("bindless_test")
+                        //     .read(test2, depth)
+                        //     .read(test2, color)
+                        //     .write(IMPORTED, swapchain)
+                        //     .dispatch(DispatchSize::FullScreen);
+
+                        let x = ComputePass::new(&mut rg, "X")
+                            .read(IMPORTED, C)
+                            .write(IMPORTED, A)
                             .shader("bindless_test")
-                            .read(test2, depth)
-                            .read(test2, color)
-                            .write(IMPORTED, swapchain)
                             .dispatch(DispatchSize::FullScreen);
-                        rg.draw_frame(test);
+                        let y = ComputePass::new(&mut rg, "Y")
+                            .write(IMPORTED, B)
+                            .shader("bindless_test")
+                            .dispatch(DispatchSize::FullScreen);
+                        let z = ComputePass::new(&mut rg, "Z")
+                            .read(x, A)
+                            .write(IMPORTED, C)
+                            .shader("bindless_test")
+                            .dispatch(DispatchSize::FullScreen);
+                        let w = ComputePass::new(&mut rg, "W")
+                            .read(y, B)
+                            .write(x, A)
+                            .shader("bindless_test")
+                            .dispatch(DispatchSize::FullScreen);
+                        let out = ComputePass::new(&mut rg, "out")
+                            .read(w, A)
+                            .read(z, C)
+                            .write(IMPORTED, swapchain)
+                            .shader("out")
+                            .dispatch(DispatchSize::FullScreen);
+                        // let x = ComputePass::new(&mut rg, "X")
+                        //     .read_write(IMPORTED, swapchain)
+                        //     .shader("bindless_test")
+                        //     .dispatch(DispatchSize::FullScreen);
+                        // let y = ComputePass::new(&mut rg, "Y")
+                        //     .read_write(x, swapchain)
+                        //     .shader("bindless_test")
+                        //     .dispatch(DispatchSize::FullScreen);
+                        // let z = ComputePass::new(&mut rg, "Z")
+                        //     .read_write(y, swapchain)
+                        //     .shader("bindless_test")
+                        //     .dispatch(DispatchSize::FullScreen);
+                        rg.draw_frame(out);
                         // let ui = imgui.context.frame();
                         // ui.window("Constants Editor")
                         //     .size([300.0, WINDOW_SIZE.y as f32], Condition::FirstUseEver)

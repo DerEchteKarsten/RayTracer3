@@ -75,7 +75,8 @@ pub(super) fn create_device(
     let features = vk::PhysicalDeviceFeatures::default()
         .shader_int64(true)
         .fragment_stores_and_atomics(true)
-        .shader_int16(true);
+        .shader_int16(true)
+        .vertex_pipeline_stores_and_atomics(true);
 
     let mut mesh_shading = vk::PhysicalDeviceMeshShaderFeaturesEXT::default()
         .task_shader(true)

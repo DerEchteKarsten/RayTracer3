@@ -124,13 +124,18 @@ impl Swapchain {
 
         let images = images
             .into_iter()
-            .map(|i| Image {
-                usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
-                image: i,
-                format: format.format,
-                extent,
-                view: Image::view(&ctx.device, extent, i, format.format),
-                allocation: None,
+            .enumerate()
+            .map(|(i, image)| {
+                ctx.set_debug_name(&format!("SwpachainImage{}", i), image);
+
+                Image {
+                    usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                    image,
+                    format: format.format,
+                    extent,
+                    view: Image::view(&ctx.device, extent, image, format.format),
+                    allocation: None,
+                }
             })
             .collect::<Vec<_>>();
 
@@ -185,7 +190,7 @@ impl Swapchain {
             .wait_semaphores(&binding);
         unsafe {
             self.ash_swapchain
-                .queue_present(ctx.present_queue, &present_info)
+                .queue_present(ctx.graphics_queue, &present_info)
                 .unwrap()
         };
     }
