@@ -2,6 +2,7 @@ use std::{collections::HashMap, ffi::CStr, mem::MaybeUninit, sync::Once};
 
 use anyhow::Result;
 use ash::vk;
+use bevy_ecs::resource::Resource;
 
 use crate::WINDOW_SIZE;
 
@@ -21,9 +22,16 @@ pub struct ComputePipelineHandle {
 }
 
 impl ComputePipelineHandle {
-    pub fn dispatch(&self, cmd: &vk::CommandBuffer, x: u32, y: u32, z: u32) {
-        let ctx = Context::get();
-        let pipeline = PipelineCache::get_compute_pipeline(self);
+    pub fn dispatch(
+        &self,
+        ctx: &Context,
+        cache: &mut PipelineCache,
+        cmd: &vk::CommandBuffer,
+        x: u32,
+        y: u32,
+        z: u32,
+    ) {
+        let pipeline = cache.get_compute_pipeline(ctx, self);
         unsafe {
             ctx.device
                 .cmd_bind_pipeline(*cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
@@ -39,15 +47,21 @@ pub struct RayTracingPipelineHandle {
 }
 
 impl RayTracingPipelineHandle {
-    pub fn launch(&self, cmd: &vk::CommandBuffer, x: u32, y: u32) {
-        let (pipeline, sbt) = PipelineCache::get_raytracing_pipeline(self);
+    pub fn launch(
+        &self,
+        ctx: &mut Context,
+        cache: &mut PipelineCache,
+        raytracing_ctx: &RayTracingContext,
+        cmd: &vk::CommandBuffer,
+        x: u32,
+        y: u32,
+    ) {
+        let (pipeline, sbt) = cache.get_raytracing_pipeline(ctx, raytracing_ctx, self);
         unsafe {
-            let raytracing = RayTracingContext::get().unwrap();
-            let ctx = Context::get();
             ctx.device
                 .cmd_bind_pipeline(*cmd, vk::PipelineBindPoint::RAY_TRACING_KHR, *pipeline);
             let call_region = vk::StridedDeviceAddressRegionKHR::default();
-            raytracing.pipeline_fn.cmd_trace_rays(
+            raytracing_ctx.pipeline_fn.cmd_trace_rays(
                 *cmd,
                 &sbt.raygen_region,
                 &sbt.miss_region,
@@ -80,8 +94,10 @@ struct RasterPipelineHash {
 impl RasterPipelineHandle {
     pub fn dispatch(
         &self,
+        ctx: &Context,
+        cache: &mut PipelineCache,
         cmd: vk::CommandBuffer,
-        color_attachments: &[ImageHandle],
+        color_attachments: &[(ImageHandle, Option<[f32; 4]>)],
         depth_attachment: &Option<ImageHandle>,
         stencil_attachment: &Option<ImageHandle>,
         width: u32,
@@ -92,7 +108,7 @@ impl RasterPipelineHandle {
     ) {
         let color_formats = color_attachments
             .iter()
-            .map(|e| e.format)
+            .map(|e| e.0.format)
             .collect::<Vec<_>>();
         let depth_format = depth_attachment
             .and_then(|d| Some(d.format))
@@ -101,23 +117,26 @@ impl RasterPipelineHandle {
             .and_then(|d| Some(d.format))
             .unwrap_or(vk::Format::UNDEFINED);
 
-        let ctx = Context::get();
         let pipeline =
-            PipelineCache::get_raster_pipeline(self, color_formats, depth_format, stencil_format);
+            cache.get_raster_pipeline(ctx, self, color_formats, depth_format, stencil_format);
 
         let color_attachments = color_attachments
             .iter()
             .map(|e| {
-                vk::RenderingAttachmentInfo::default()
+                let ret = vk::RenderingAttachmentInfo::default()
                     .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .image_view(e.view)
-                    .clear_value(vk::ClearValue {
+                    .image_view(e.0.view)
+                    .store_op(vk::AttachmentStoreOp::STORE);
+                if let Some(clear_color) = e.1 {
+                    ret.clear_value(vk::ClearValue {
                         color: vk::ClearColorValue {
-                            float32: [0.0, 0.0, 1.0, 0.0],
+                            float32: clear_color,
                         },
                     })
                     .load_op(vk::AttachmentLoadOp::CLEAR)
-                    .store_op(vk::AttachmentStoreOp::STORE)
+                } else {
+                    ret.load_op(vk::AttachmentLoadOp::LOAD)
+                }
             })
             .collect::<Vec<_>>();
         let mut rendering_info = vk::RenderingInfo::default()
@@ -190,13 +209,14 @@ impl RasterPipelineHandle {
                     offset: vk::Offset2D { x: 0, y: 0 },
                 }],
             );
-            // ctx.mesh_fn.cmd_draw_mesh_tasks(cmd, x, y, z);
-            ctx.device.cmd_draw(cmd, 3, 1, 0, 0);
+            ctx.mesh_fn.cmd_draw_mesh_tasks(cmd, x, y, z);
+            // ctx.device.cmd_draw(cmd, 3, 1, 0, 0);
             ctx.device.cmd_end_rendering(cmd);
         };
     }
 }
 
+#[derive(Resource)]
 pub(crate) struct PipelineCache {
     compute_pipelines: HashMap<ComputePipelineHandle, vk::Pipeline>,
     raster_pipelines: HashMap<RasterPipelineHash, vk::Pipeline>,
@@ -204,10 +224,12 @@ pub(crate) struct PipelineCache {
     shader_cache: HashMap<String, vk::ShaderModule>,
 }
 
-static mut CACHE: MaybeUninit<PipelineCache> = MaybeUninit::uninit();
-
 impl PipelineCache {
-    pub(crate) fn create_shader_module(&mut self, code_path: &str) -> Result<vk::ShaderModule> {
+    pub(crate) fn create_shader_module(
+        &mut self,
+        ctx: &Context,
+        code_path: &str,
+    ) -> Result<vk::ShaderModule> {
         match self.shader_cache.get(code_path) {
             Some(module) => Ok(*module),
             None => {
@@ -215,11 +237,7 @@ impl PipelineCache {
                 let decoded_code = ash::util::read_spv(&mut code)?;
                 let create_info = vk::ShaderModuleCreateInfo::default().code(&decoded_code);
 
-                let module = unsafe {
-                    Context::get()
-                        .device
-                        .create_shader_module(&create_info, None)?
-                };
+                let module = unsafe { ctx.device.create_shader_module(&create_info, None)? };
                 self.shader_cache.insert(code_path.to_string(), module);
                 Ok(module)
             }
@@ -228,29 +246,16 @@ impl PipelineCache {
 
     fn create_shader_stage<'a>(
         &mut self,
+        ctx: &Context,
         code_path: &str,
         main: &'a str,
         stage: vk::ShaderStageFlags,
     ) -> Result<vk::PipelineShaderStageCreateInfo<'a>> {
-        let module = self.create_shader_module(code_path)?;
+        let module = self.create_shader_module(ctx, code_path)?;
         Ok(vk::PipelineShaderStageCreateInfo::default()
             .stage(stage)
             .module(module)
             .name(CStr::from_bytes_with_nul(main.as_bytes())?))
-    }
-
-    pub fn init() {
-        unsafe {
-            CACHE.write(PipelineCache::new());
-        }
-    }
-
-    pub fn get() -> &'static PipelineCache {
-        unsafe { CACHE.assume_init_ref() }
-    }
-
-    pub fn get_mut() -> &'static mut PipelineCache {
-        unsafe { CACHE.assume_init_mut() }
     }
 
     pub fn new() -> Self {
@@ -262,20 +267,21 @@ impl PipelineCache {
         }
     }
 
-    pub fn get_compute_pipeline(handle: &ComputePipelineHandle) -> vk::Pipeline {
-        let s = Self::get_mut();
-        match s.compute_pipelines.get(handle) {
+    pub fn get_compute_pipeline(
+        &mut self,
+        ctx: &Context,
+        handle: &ComputePipelineHandle,
+    ) -> vk::Pipeline {
+        match self.compute_pipelines.get(handle) {
             Some(pipeline) => pipeline.clone(),
             None => {
                 let entry = format!("{}\0", handle.entry);
                 let path = format!("./shaders/bin/{}.slang.spv", handle.path);
 
-                let ctx = Context::get();
                 let create_info = vk::ComputePipelineCreateInfo::default()
-                    .layout(BindlessDescriptorHeap::get().layout)
+                    .layout(BindlessDescriptorHeap::get_layout())
                     .stage(
-                        Self::get_mut()
-                            .create_shader_stage(&path, &entry, vk::ShaderStageFlags::COMPUTE)
+                        self.create_shader_stage(ctx, &path, &entry, vk::ShaderStageFlags::COMPUTE)
                             .unwrap(),
                     );
                 let pipeline = unsafe {
@@ -284,83 +290,86 @@ impl PipelineCache {
                         .unwrap()
                 }[0];
                 ctx.set_debug_name(&handle.path, pipeline);
-                Self::get_mut()
-                    .compute_pipelines
+                self.compute_pipelines
                     .insert(handle.clone(), pipeline.clone());
                 pipeline
             }
         }
     }
 
-    pub fn get_raytracing_pipeline(
-        handle: &RayTracingPipelineHandle,
-    ) -> &(vk::Pipeline, ShaderBindingTable) {
-        let s = Self::get_mut();
-        match s.raytracing_pipelines.get(handle) {
-            Some(pipeline) => pipeline,
-            None => {
-                let entry = format!("{}\0", handle.entry);
-                let path = format!("./shaders/bin/{}.slang.spv", handle.path,);
+    pub fn get_raytracing_pipeline<'a, 'b>(
+        &'b mut self,
+        ctx: &mut Context,
+        raytracing_ctx: &RayTracingContext,
+        handle: &'a RayTracingPipelineHandle,
+    ) -> &'a (vk::Pipeline, ShaderBindingTable)
+    where
+        'b: 'a,
+    {
+        if self.raytracing_pipelines.contains_key(handle) {
+            self.raytracing_pipelines.get(handle).unwrap()
+        } else {
+            let entry = format!("{}\0", handle.entry);
+            let path = format!("./shaders/bin/{}.slang.spv", handle.path,);
 
-                let raytracing_ctx = RayTracingContext::get().unwrap();
-                let (pipeline, shader_binding_table) = raytracing_ctx
-                    .create_raytracing_pipeline(
-                        BindlessDescriptorHeap::get().layout,
-                        &[
-                            RayTracingShaderCreateInfo {
-                                group: crate::raytracing::RayTracingShaderGroup::RayGen,
-                                source: &[(&path, &entry, vk::ShaderStageFlags::RAYGEN_KHR)],
-                            },
-                            RayTracingShaderCreateInfo {
-                                group: crate::raytracing::RayTracingShaderGroup::Hit,
-                                source: &[(
-                                    "shaders/bin/default_hit",
-                                    "main\0",
-                                    vk::ShaderStageFlags::CLOSEST_HIT_KHR,
-                                )],
-                            },
-                            RayTracingShaderCreateInfo {
-                                group: crate::raytracing::RayTracingShaderGroup::Miss,
-                                source: &[(
-                                    "shaders/bin/default_miss",
-                                    "main\0",
-                                    vk::ShaderStageFlags::MISS_KHR,
-                                )],
-                            },
-                        ],
-                    )
-                    .unwrap();
-                Context::get().set_debug_name(&handle.path, pipeline);
-                Self::get_mut()
-                    .raytracing_pipelines
-                    .insert(handle.clone(), (pipeline, shader_binding_table));
-                Self::get().raytracing_pipelines.get(handle).unwrap()
-            }
+            let (pipeline, shader_binding_table) = raytracing_ctx
+                .create_raytracing_pipeline(
+                    ctx,
+                    raytracing_ctx,
+                    self,
+                    BindlessDescriptorHeap::get_layout(),
+                    &[
+                        RayTracingShaderCreateInfo {
+                            group: crate::raytracing::RayTracingShaderGroup::RayGen,
+                            source: &[(&path, &entry, vk::ShaderStageFlags::RAYGEN_KHR)],
+                        },
+                        RayTracingShaderCreateInfo {
+                            group: crate::raytracing::RayTracingShaderGroup::Hit,
+                            source: &[(
+                                "shaders/bin/default_hit",
+                                "main\0",
+                                vk::ShaderStageFlags::CLOSEST_HIT_KHR,
+                            )],
+                        },
+                        RayTracingShaderCreateInfo {
+                            group: crate::raytracing::RayTracingShaderGroup::Miss,
+                            source: &[(
+                                "shaders/bin/default_miss",
+                                "main\0",
+                                vk::ShaderStageFlags::MISS_KHR,
+                            )],
+                        },
+                    ],
+                )
+                .unwrap();
+            ctx.set_debug_name(&handle.path, pipeline);
+            self.raytracing_pipelines
+                .insert(handle.clone(), (pipeline, shader_binding_table));
+            self.raytracing_pipelines.get(handle).unwrap()
         }
     }
 
     pub fn get_raster_pipeline(
+        &mut self,
+        ctx: &Context,
         handle: &RasterPipelineHandle,
         color_formats: Vec<vk::Format>,
         depth_format: vk::Format,
         stencil_format: vk::Format,
     ) -> vk::Pipeline {
-        let s = Self::get_mut();
         let hash = RasterPipelineHash {
             handle: handle.clone(),
             color_formats,
             depth_format,
             stencil_format,
         };
-        match s.raster_pipelines.get(&hash) {
+        match self.raster_pipelines.get(&hash) {
             Some(pipeline) => pipeline.clone(),
             None => {
                 let fragment_entry = format!("{}\0", handle.fragment_entry);
                 let fragment_path = format!("./shaders/bin/{}.slang.spv", handle.fragment_path);
                 let mesh_entry = format!("{}\0", handle.mesh_entry);
                 let mesh_path = format!("./shaders/bin/{}.slang.spv", handle.mesh_path);
-
-                let ctx = Context::get();
 
                 let mut rendering = vk::PipelineRenderingCreateInfo::default()
                     .color_attachment_formats(&hash.color_formats)
@@ -403,16 +412,20 @@ impl PipelineCache {
                     .logic_op(vk::LogicOp::COPY)
                     .blend_constants([0.0, 0.0, 0.0, 0.0]);
                 let stages = [
-                    Self::get_mut()
-                        .create_shader_stage(&mesh_path, &mesh_entry, vk::ShaderStageFlags::VERTEX)
-                        .unwrap(),
-                    Self::get_mut()
-                        .create_shader_stage(
-                            &fragment_path,
-                            &fragment_entry,
-                            vk::ShaderStageFlags::FRAGMENT,
-                        )
-                        .unwrap(),
+                    self.create_shader_stage(
+                        ctx,
+                        &mesh_path,
+                        &mesh_entry,
+                        vk::ShaderStageFlags::MESH_EXT,
+                    )
+                    .unwrap(),
+                    self.create_shader_stage(
+                        ctx,
+                        &fragment_path,
+                        &fragment_entry,
+                        vk::ShaderStageFlags::FRAGMENT,
+                    )
+                    .unwrap(),
                 ];
                 let viewport_state = vk::PipelineViewportStateCreateInfo::default()
                     .scissor_count(1)
@@ -438,13 +451,13 @@ impl PipelineCache {
                     .stencil_test_enable(false);
                 let create_info = vk::GraphicsPipelineCreateInfo::default()
                     .stages(&stages)
-                    .layout(BindlessDescriptorHeap::get().layout)
+                    .layout(BindlessDescriptorHeap::get_layout())
                     .dynamic_state(&dynamic_state)
                     .multisample_state(&multisampling)
                     .color_blend_state(&color_blend_state)
                     .rasterization_state(&rasterization_state)
-                    .input_assembly_state(&input_assembly_state)
-                    .vertex_input_state(&vertex_input_info)
+                    // .input_assembly_state(&input_assembly_state)
+                    // .vertex_input_state(&vertex_input_info)
                     .viewport_state(&viewport_state)
                     .depth_stencil_state(&depth_stencil_state)
                     .base_pipeline_handle(vk::Pipeline::null())
@@ -457,9 +470,7 @@ impl PipelineCache {
                         .unwrap()
                 }[0];
 
-                Self::get_mut()
-                    .raster_pipelines
-                    .insert(hash, pipeline.clone());
+                self.raster_pipelines.insert(hash, pipeline.clone());
                 pipeline
             }
         }

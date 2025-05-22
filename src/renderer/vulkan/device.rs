@@ -2,28 +2,29 @@ use std::ffi::CStr;
 
 use anyhow::Result;
 use ash::{
-    ext::extended_dynamic_state3,
+    ext::{extended_dynamic_state3, mesh_shader},
     khr::{
-        get_memory_requirements2, shader_float_controls, shader_non_semantic_info, synchronization2,
+        acceleration_structure, deferred_host_operations, get_memory_requirements2,
+        ray_tracing_pipeline, shader_float_controls, shader_non_semantic_info, synchronization2,
     },
     vk,
 };
 
 use super::physical_device::{PhysicalDevice, QueueFamily};
 
-pub const DEVICE_EXTENSIONS: [&'static CStr; 9] = [
+pub const DEVICE_EXTENSIONS: [&'static CStr; 13] = [
     ash::khr::swapchain::NAME,
-    // ray_tracing_pipeline::NAME,
-    // acceleration_structure::NAME,
+    ray_tracing_pipeline::NAME,
+    acceleration_structure::NAME,
     ash::ext::descriptor_indexing::NAME,
     ash::ext::scalar_block_layout::NAME,
     get_memory_requirements2::NAME,
-    // deferred_host_operations::NAME,
+    deferred_host_operations::NAME,
     vk::KHR_SPIRV_1_4_NAME,
     shader_float_controls::NAME,
     shader_non_semantic_info::NAME,
     synchronization2::NAME,
-    // mesh_shader::NAME,
+    mesh_shader::NAME,
     extended_dynamic_state3::NAME,
 ];
 
@@ -95,9 +96,9 @@ pub(super) fn create_device(
         .features(features)
         .push_next(&mut vulkan_12_features)
         .push_next(&mut vulkan_13_features)
-        // .push_next(&mut ray_tracing_feature)
-        // .push_next(&mut acceleration_struct_feature)
-        // .push_next(&mut mesh_shading)
+        .push_next(&mut ray_tracing_feature)
+        .push_next(&mut acceleration_struct_feature)
+        .push_next(&mut mesh_shading)
         .push_next(&mut dynamic_state)
         .push_next(&mut dynamic_state2);
     // .push_next(&mut atomics);

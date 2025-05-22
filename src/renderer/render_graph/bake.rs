@@ -6,22 +6,24 @@ use std::{
 
 use anyhow::Result;
 use ash::vk;
+use bevy_ecs::{system::ResMut, world::World};
 
 use crate::{
-    backend::bindless::BindlessDescriptorHeap,
+    raytracing::RayTracingContext,
+    renderer::bindless::BindlessDescriptorHeap,
     vulkan::{image::ImageType, swapchain::FRAMES_IN_FLIGHT, Context},
 };
 
 use super::{
-    depends_on, Barrier, Barriers, EdgeType, Event, ExecutionTrait, Node, NodeEdge, NodeHandle, RenderGraph, ResourceHandle
+    depends_on, Barrier, Barriers, EdgeType, Event, ExecutionTrait, Node, NodeEdge, NodeHandle,
+    RenderGraph, ResourceHandle,
 };
 
 #[derive(Default, Debug)]
-struct PhysicalBarriers<'a> {
-    buffers: Vec<vk::BufferMemoryBarrier2<'a>>,
-    images: Vec<vk::ImageMemoryBarrier2<'a>>,
+pub(super) struct PhysicalBarriers<'a> {
+    pub(super) buffers: Vec<vk::BufferMemoryBarrier2<'a>>,
+    pub(super) images: Vec<vk::ImageMemoryBarrier2<'a>>,
 }
-
 
 impl RenderGraph {
     fn flatten<'a>(&'a self, root_node: NodeHandle, execution_order: &mut Vec<NodeHandle>) {
@@ -53,9 +55,8 @@ impl RenderGraph {
             if pass.bindings().count() != 0 {
                 let bindings = pass
                     .bindings()
-                    .map(|e| self.resources[e.resource.0 as usize].descriptor)
+                    .map(|e| self.resources[e.resource].descriptor.0)
                     .collect::<Vec<_>>();
-
                 unsafe {
                     (self
                         .descriptor_buffer
@@ -80,53 +81,21 @@ impl RenderGraph {
 
         Ok(offsets)
     }
-    pub fn begin_frame(&mut self) {
-        self.constants.clear();
-        self.nodes.clear();
-        self.resources.iter_mut().for_each(|resource| {
-            resource.event.invalidated_in_stage = [vk::AccessFlags2::empty(); 25];
-            resource.event.pipeline_barrier_src_stages = vk::PipelineStageFlags2::empty();
-            resource.event.to_flush = vk::AccessFlags2::default();
-            resource.event.layout = vk::ImageLayout::UNDEFINED;
-        });
 
-        let frame_in_flight = self.frame_number as usize % FRAMES_IN_FLIGHT;
-        let frame = self.frame_data[frame_in_flight].clone();
-        let ctx = Context::get();
-
-        let semaphore = [self.frame_timeline_semaphore];
-        let values = [frame.frame_number];
-        let wait_info = vk::SemaphoreWaitInfo::default()
-            .semaphores(&semaphore)
-            .values(&values);
-        unsafe { ctx.device.wait_semaphores(&wait_info, 1000000000).unwrap() };
-        unsafe {
-            ctx.device
-                .reset_command_pool(frame.command_pool, vk::CommandPoolResetFlags::empty())
-                .unwrap()
-        };
-
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-
-        unsafe {
-            ctx.device
-                .begin_command_buffer(frame.cmd, &begin_info)
-                .unwrap()
-        };
-
-        self.swapchain_image_index = self.swapchain.next_image(frame_in_flight);
-    }
-
-    fn create_barriers<'a, 'b>(&'b mut self, execution_order: &Vec<NodeHandle>) -> Vec<PhysicalBarriers<'a>> 
-    where 'a: 'b{
+    pub(super) fn create_barriers<'a, 'b>(
+        &'b mut self,
+        execution_order: &Vec<NodeHandle>,
+    ) -> Vec<PhysicalBarriers<'a>>
+    where
+        'a: 'b,
+    {
         execution_order
             .iter()
             .chain(vec![&!0])
             .map(|pass| {
                 let mut need_pipeline_barrier = false;
                 let mut barriers = PhysicalBarriers::default();
-                
+
                 let pass_barriers = if *pass == !0 {
                     Barriers {
                         invalidates: vec![Barrier {
@@ -137,18 +106,18 @@ impl RenderGraph {
                         }],
                         flushes: Vec::new(),
                     }
-                }else {
+                } else {
                     self.nodes[*pass].get_barriers(self)
                 };
 
                 for barrier in pass_barriers.invalidates {
                     if let Some(buffer) = self.buffer_handle(barrier.resource) {
-                        let event = &mut self.resources[barrier.resource.0 as usize].event;
+                        let event = &mut self.resources[barrier.resource].event;
 
                         if (!event.to_flush.is_empty()) || barrier.need_invalidate(event) {
                             need_pipeline_barrier = !event.pipeline_barrier_src_stages.is_empty();
                         }
-                        
+
                         if need_pipeline_barrier {
                             barriers.buffers.push(vk::BufferMemoryBarrier2 {
                                 src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
@@ -166,8 +135,9 @@ impl RenderGraph {
                     };
                     let mut layout_change = false;
                     if let Some(image) = self.image_handle(barrier.resource) {
-                        layout_change = self.resources[barrier.resource.0 as usize].event.layout != barrier.layout;
-                        let event = &mut self.resources[barrier.resource.0 as usize].event;
+                        layout_change =
+                            self.resources[barrier.resource].event.layout != barrier.layout;
+                        let event = &mut self.resources[barrier.resource].event;
                         let mut image_barrier = vk::ImageMemoryBarrier2 {
                             src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                             dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
@@ -185,8 +155,7 @@ impl RenderGraph {
                             || (!event.to_flush.is_empty())
                             || barrier.need_invalidate(&event)
                         {
-                            if event.pipeline_barrier_src_stages.as_raw() > 0
-                            {
+                            if event.pipeline_barrier_src_stages.as_raw() > 0 {
                                 image_barrier.src_stage_mask = event.pipeline_barrier_src_stages;
                                 need_pipeline_barrier = true;
                             } else {
@@ -198,7 +167,7 @@ impl RenderGraph {
                         event.layout = barrier.layout;
                     };
 
-                    let event = &mut self.resources[barrier.resource.0 as usize].event;
+                    let event = &mut self.resources[barrier.resource].event;
                     if event.to_flush.as_raw() > 0 || layout_change {
                         for e in &mut event.invalidated_in_stage {
                             *e = vk::AccessFlags2::empty();
@@ -215,9 +184,9 @@ impl RenderGraph {
                 }
                 for barrier in pass_barriers.flushes.iter() {
                     if self.image_handle(barrier.resource).is_some() {
-                        self.resources[barrier.resource.0 as usize].event.layout = barrier.layout;
+                        self.resources[barrier.resource].event.layout = barrier.layout;
                     }
-                    let event = &mut self.resources[barrier.resource.0 as usize].event;
+                    let event = &mut self.resources[barrier.resource].event;
                     event.to_flush = barrier.access;
                     event.pipeline_barrier_src_stages = barrier.stages;
                 }
@@ -225,89 +194,5 @@ impl RenderGraph {
                 barriers
             })
             .collect::<Vec<_>>()
-    }
-
-    //TODO Error Handeling
-    pub fn draw_frame(&mut self, root_node: NodeHandle) {
-        let frame_in_flight = self.frame_number as usize % FRAMES_IN_FLIGHT;
-        let frame = self.frame_data[frame_in_flight].clone();
-        let ctx = Context::get();
-        // println!("ImportedBuffer: {:#?}, ImportedImages: {:#?}, Buffers: {:#?}, Images: {:#?}", self.descriptor_handles[0], self.descriptor_handles[1], self.descriptor_handles[2], self.descriptor_handles[3]);
-
-        BindlessDescriptorHeap::get().bind(&frame.cmd).unwrap();
-
-        let descriptor_offsets = self.write_bindings().unwrap();
-        let execution_order = if self.nodes.len() > 2 {
-            self.bake(root_node).unwrap()
-        } else if self.nodes.len() == 1 {
-            vec![0, 1]
-        }else {
-            vec![0]
-        };
-
-        let barriers = self.create_barriers(&execution_order);
-        for (pass_index, pass_handle) in execution_order.iter().enumerate() {
-            let pass = &self.nodes[*pass_handle];
-            unsafe {
-                pass.cmd_push_constants(self, &frame, descriptor_offsets[pass_index] as u32 * size_of::<u32>() as u32);
-
-                let barrier = &barriers[pass_index];
-                if barrier.images.len() != 0 || barrier.buffers.len() != 0 {
-                    ctx.cmd_insert_label(&frame.cmd, &format!("Barrier for {}", pass.name));
-                    let dependency_info = vk::DependencyInfo::default()
-                        .buffer_memory_barriers(&barrier.buffers)
-                        .image_memory_barriers(&barrier.images);
-                    ctx.device
-                        .cmd_pipeline_barrier2(frame.cmd, &dependency_info);
-                }
-
-                ctx.cmd_start_label(&frame.cmd, &pass.name);
-                pass.execution
-                    .execute(&frame.cmd, self, &pass.edges)
-                    .unwrap();
-                ctx.cmd_end_label(&frame.cmd);
-            }
-        }
-
-        if let Some(barrier) = barriers.get(execution_order.len()) {
-            ctx.cmd_insert_label(&frame.cmd, "Transitioning Swapchain Image");
-            let dependency_info = vk::DependencyInfo::default()
-                .buffer_memory_barriers(&barrier.buffers)
-                .image_memory_barriers(&barrier.images);
-            unsafe {
-                ctx.device
-                    .cmd_pipeline_barrier2(frame.cmd, &dependency_info)
-            };
-        }
-
-        let end_stage = self.nodes[root_node].execution.get_stages();
-        unsafe { ctx.device.end_command_buffer(frame.cmd).unwrap() };
-
-        let wait_semaphores = [vk::SemaphoreSubmitInfo::default()
-            .semaphore(self.swapchain.frame_resources[frame_in_flight].image_availible_semaphore)
-            .stage_mask(end_stage)];
-
-        let signal_frame_value = frame.frame_number + FRAMES_IN_FLIGHT as u64;
-        self.frame_data[frame_in_flight].frame_number = signal_frame_value;
-
-        let signal_semaphores = [
-            vk::SemaphoreSubmitInfo::default()
-                .semaphore(
-                    self.swapchain.frame_resources[frame_in_flight as usize]
-                        .render_finished_semaphore,
-                )
-                .stage_mask(end_stage),
-            vk::SemaphoreSubmitInfo::default()
-                .semaphore(self.frame_timeline_semaphore)
-                .stage_mask(end_stage)
-                .value(signal_frame_value),
-        ];
-
-        ctx.submit(&frame.cmd, &wait_semaphores, &signal_semaphores);
-
-        self.swapchain
-            .present(frame_in_flight, self.swapchain_image_index);
-
-        self.frame_number += 1;
     }
 }

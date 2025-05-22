@@ -7,6 +7,26 @@ struct Offsets {
     RenderResourceHandle bindings_buffer;
     RenderResourceHandle constants_buffer;
 }
+
+struct RenderResourceHandle {
+    uint handle;
+    
+    uint index() {
+        return handle & 0xfffffff;
+    }
+
+    uint tag() {
+        return handle >> 30;
+    }
+}
+struct InstanceInfo {
+    RenderResourceHandle index_buffer;
+    RenderResourceHandle vertex_buffer;
+    RenderResourceHandle transform_buffer;
+    RenderResourceHandle geometry_buffer;
+    float4x4 transform;
+}
+
 [[vk::push_constant]] ConstantBuffer<Offsets> g_offsets;
 
 [vk::binding(0, 0)] RWByteAddressBuffer bufferHandles[];
@@ -43,17 +63,6 @@ T loadConstants<T>() {
 }
 
 
-struct RenderResourceHandle {
-    uint handle;
-    
-    uint index() {
-        return handle & 0xfffffff;
-    }
-
-    uint tag() {
-        return handle >> 30;
-    }
-}
 
 struct Buffer<T> {
     RenderResourceHandle handle;

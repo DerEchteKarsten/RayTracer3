@@ -10,7 +10,6 @@ struct Vertex {
 };
 
 struct GeometryInfo {
-	float4x4 transform;
 	float4 baseColor;
 	int baseColorTextureIndex;
 	float metallicFactor;

@@ -3,6 +3,8 @@ mod image;
 mod material;
 mod texture;
 
+use bevy_asset::Asset;
+use bevy_reflect::TypePath;
 pub use error::*;
 pub use image::*;
 pub use material::*;
@@ -11,10 +13,10 @@ pub use texture::*;
 use std::{collections::HashMap, path::Path};
 
 use glam::{vec4, Vec2, Vec4};
-use gltf::{Primitive, Semantic};
+use gltf::{import_buffers, import_images, Document, Gltf, Primitive, Semantic};
 
 #[derive(Debug, Clone)]
-pub struct Model {
+pub(crate) struct GltfModel {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
     pub nodes: Vec<Node>,
@@ -47,9 +49,20 @@ pub struct Vertex {
     pub uvs: Vec2,
 }
 
-pub fn load_file<P: AsRef<Path>>(path: P) -> Result<Model> {
+fn import_impl(
+    Gltf { document, blob }: Gltf,
+    base: Option<&Path>,
+) -> gltf::Result<(Document, Vec<gltf::buffer::Data>, Vec<gltf::image::Data>)> {
+    let buffer_data = import_buffers(&document, base, blob)?;
+    let image_data = import_images(&document, base, &buffer_data)?;
+    let import = (document, buffer_data, image_data);
+    Ok(import)
+}
+
+pub fn from_bytes(bytes: &[u8]) -> Result<GltfModel> {
+    let gltf = Gltf::from_slice(bytes).map_err(|e| Error::Load(e.to_string()))?;
     let (document, buffers, gltf_images) =
-        gltf::import(&path).map_err(|e| Error::Load(e.to_string()))?;
+        import_impl(gltf, None).map_err(|e| Error::Load(e.to_string()))?;
 
     let mut vertices = vec![];
     let mut indices = vec![];
@@ -157,7 +170,7 @@ pub fn load_file<P: AsRef<Path>>(path: P) -> Result<Model> {
 
     let textures = document.textures().map(Texture::from).collect::<Vec<_>>();
 
-    Ok(Model {
+    Ok(GltfModel {
         vertices,
         indices,
         nodes,

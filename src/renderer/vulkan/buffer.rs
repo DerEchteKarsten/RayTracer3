@@ -13,7 +13,7 @@ use super::{
 };
 
 #[derive(Derivative)]
-#[derivative(Eq, PartialEq)]
+#[derivative(Eq, PartialEq, Debug)]
 pub struct Buffer {
     pub(crate) buffer: vk::Buffer,
     #[derivative(PartialEq = "ignore")]
@@ -90,6 +90,7 @@ pub(crate) trait BufferType {
     fn get_usage(&self) -> vk::BufferUsageFlags;
     fn copy_to_image(
         &self,
+        ctx: &Context,
         cmd: &vk::CommandBuffer,
         dst: &impl ImageType,
         layout: vk::ImageLayout,
@@ -108,7 +109,7 @@ pub(crate) trait BufferType {
             });
 
         unsafe {
-            Context::get().device.cmd_copy_buffer_to_image(
+            ctx.device.cmd_copy_buffer_to_image(
                 *cmd,
                 self.to_vk(),
                 dst.get_image(),
@@ -118,8 +119,7 @@ pub(crate) trait BufferType {
         };
     }
 
-    fn copy(&self, cmd: &vk::CommandBuffer, dst_buffer: &impl BufferType) {
-        let ctx = Context::get();
+    fn copy(&self, ctx: &Context, cmd: &vk::CommandBuffer, dst_buffer: &impl BufferType) {
         unsafe {
             let region = vk::BufferCopy::default().size(self.get_size());
             ctx.device.cmd_copy_buffer(
@@ -134,12 +134,12 @@ pub(crate) trait BufferType {
 
 impl Buffer {
     pub fn new_aligned(
+        ctx: &mut Context,
         usage: vk::BufferUsageFlags,
         memory_location: MemoryLocation,
         size: vk::DeviceSize,
         alignment: Option<u64>,
     ) -> Result<Self> {
-        let ctx = Context::get_mut();
         let create_info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(usage | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS);
@@ -173,11 +173,12 @@ impl Buffer {
     }
 
     pub fn new(
+        ctx: &mut Context,
         usage: vk::BufferUsageFlags,
         memory_location: MemoryLocation,
         size: vk::DeviceSize,
     ) -> Result<Self> {
-        Self::new_aligned(usage, memory_location, size, None)
+        Self::new_aligned(ctx, usage, memory_location, size, None)
     }
 
     pub fn copy_data_to_buffer<T: Copy>(&self, data: &[T]) -> Result<()> {
@@ -200,8 +201,7 @@ impl Buffer {
         Ok(())
     }
 
-    pub(crate) fn destroy(self) -> Result<()> {
-        let ctx = Context::get_mut();
+    pub(crate) fn destroy(self, ctx: &mut Context) -> Result<()> {
         unsafe { ctx.device.destroy_buffer(self.buffer, None) };
         ctx.allocator
             .free(self.allocation.ok_or(Error::msg("Buffer not Owned"))?)
@@ -210,12 +210,13 @@ impl Buffer {
     }
 
     pub(crate) fn from_data_with_size<T: Copy>(
+        ctx: &mut Context,
         usage: vk::BufferUsageFlags,
         data: &[T],
         size: u64,
     ) -> Result<Buffer> {
-        let ctx = Context::get();
         let staging_buffer = Self::new(
+            ctx,
             vk::BufferUsageFlags::TRANSFER_SRC,
             MemoryLocation::CpuToGpu,
             size,
@@ -223,20 +224,27 @@ impl Buffer {
         staging_buffer.copy_data_to_buffer(data)?;
 
         let buffer = Self::new(
+            ctx,
             usage | vk::BufferUsageFlags::TRANSFER_DST,
             MemoryLocation::GpuOnly,
             size,
         )?;
 
         ctx.execute_one_time_commands(|cmd_buffer| {
-            staging_buffer.copy(cmd_buffer, &buffer);
+            staging_buffer.copy(&ctx, cmd_buffer, &buffer);
         })?;
+
+        staging_buffer.destroy(ctx);
 
         Ok(buffer)
     }
 
-    pub(crate) fn from_data<T: Copy>(usage: vk::BufferUsageFlags, data: &[T]) -> Result<Buffer> {
+    pub(crate) fn from_data<T: Copy>(
+        ctx: &mut Context,
+        usage: vk::BufferUsageFlags,
+        data: &[T],
+    ) -> Result<Buffer> {
         let size = size_of_val(data) as _;
-        Self::from_data_with_size(usage, data, size)
+        Self::from_data_with_size(ctx, usage, data, size)
     }
 }

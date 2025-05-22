@@ -5,12 +5,17 @@ use ash::{
     khr::{acceleration_structure, ray_tracing_pipeline},
     vk, Instance,
 };
+use bevy_ecs::resource::Resource;
 use gpu_allocator::{vulkan::Allocation, MemoryLocation};
 use log::debug;
 
 use crate::PipelineCache;
 
-use super::{buffer::Buffer, sampler::alinged_size, Context};
+use super::{buffer::Buffer, Context};
+
+pub fn alinged_size(size: u32, alignment: u32) -> u32 {
+    (size + (alignment - 1)) & !(alignment - 1)
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RayTracingShaderGroupInfo {
@@ -40,6 +45,7 @@ pub struct AccelerationStructure {
     pub(crate) buffer: Buffer,
 }
 
+#[derive(Resource)]
 pub struct RayTracingContext {
     pub pipeline_properties: vk::PhysicalDeviceRayTracingPipelinePropertiesKHR<'static>,
     pub pipeline_fn: ray_tracing_pipeline::Device,
@@ -47,15 +53,9 @@ pub struct RayTracingContext {
         vk::PhysicalDeviceAccelerationStructurePropertiesKHR<'static>,
     pub acceleration_structure_fn: acceleration_structure::Device,
 }
-static mut RAYTRACING_CONTEXT: Option<RayTracingContext> = None;
 
 impl RayTracingContext {
-    pub fn get() -> Option<&'static RayTracingContext> {
-        unsafe { RAYTRACING_CONTEXT.as_ref() }
-    }
-
-    pub(crate) fn init() {
-        let ctx = Context::get();
+    pub(crate) fn new(ctx: &Context) -> Self {
         let (pipeline_properties, acceleration_structure_properties) = unsafe {
             let mut rt_pipeline_properties =
                 vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
@@ -78,24 +78,22 @@ impl RayTracingContext {
         let acceleration_structure_fn =
             ash::khr::acceleration_structure::Device::new(&ctx.instance, &ctx.device);
 
-        unsafe {
-            RAYTRACING_CONTEXT = Some(Self {
-                pipeline_properties,
-                pipeline_fn,
-                acceleration_structure_properties,
-                acceleration_structure_fn,
-            });
+        Self {
+            pipeline_properties,
+            pipeline_fn,
+            acceleration_structure_properties,
+            acceleration_structure_fn,
         }
     }
 
     pub fn create_acceleration_structure(
         &self,
+        ctx: &mut Context,
         level: vk::AccelerationStructureTypeKHR,
         as_geometry: &[vk::AccelerationStructureGeometryKHR],
         as_ranges: &[vk::AccelerationStructureBuildRangeInfoKHR],
         max_primitive_counts: &[u32],
     ) -> Result<AccelerationStructure> {
-        let ctx = Context::get();
         let build_geo_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
             .ty(level)
             .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
@@ -114,6 +112,7 @@ impl RayTracingContext {
         };
 
         let buffer = Buffer::new(
+            ctx,
             vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR,
             MemoryLocation::GpuOnly,
             build_size.acceleration_structure_size,
@@ -129,6 +128,7 @@ impl RayTracingContext {
         };
 
         let scratch_buffer = Buffer::new_aligned(
+            ctx,
             vk::BufferUsageFlags::STORAGE_BUFFER,
             MemoryLocation::GpuOnly,
             build_size.build_scratch_size,
@@ -173,10 +173,12 @@ impl RayTracingContext {
 
     pub fn create_raytracing_pipeline(
         &self,
+        ctx: &mut Context,
+        ray_tracing_ctx: &RayTracingContext,
+        shader_cache: &mut PipelineCache,
         pipeline_layout: vk::PipelineLayout,
         shaders_create_info: &[RayTracingShaderCreateInfo],
     ) -> Result<(vk::Pipeline, ShaderBindingTable)> {
-        let ctx = Context::get();
         let mut shader_group_info = RayTracingShaderGroupInfo {
             group_count: shaders_create_info.len() as u32,
             ..Default::default()
@@ -191,7 +193,7 @@ impl RayTracingContext {
             let mut this_stages = vec![];
 
             shader.source.into_iter().for_each(|s| {
-                let module = PipelineCache::get_mut().create_shader_module(s.0).unwrap();
+                let module = shader_cache.create_shader_module(&ctx, s.0).unwrap();
                 let stage = vk::PipelineShaderStageCreateInfo::default()
                     .stage(s.2)
                     .module(module)
@@ -258,7 +260,7 @@ impl RayTracingContext {
             )
         }
         .unwrap();
-        let sbt = ShaderBindingTable::new(&pipeline[0], &shader_group_info)?;
+        let sbt = ShaderBindingTable::new(ctx, ray_tracing_ctx, &pipeline[0], &shader_group_info)?;
         Ok((pipeline[0], sbt))
     }
 }
@@ -271,8 +273,12 @@ pub struct ShaderBindingTable {
 }
 
 impl ShaderBindingTable {
-    pub fn new(pipeline: &vk::Pipeline, shaders: &RayTracingShaderGroupInfo) -> Result<Self> {
-        let ray_tracing = RayTracingContext::get().unwrap();
+    pub fn new(
+        ctx: &mut Context,
+        ray_tracing: &RayTracingContext,
+        pipeline: &vk::Pipeline,
+        shaders: &RayTracingShaderGroupInfo,
+    ) -> Result<Self> {
         let desc = shaders;
 
         let handle_size = ray_tracing.pipeline_properties.shader_group_handle_size;
@@ -321,6 +327,7 @@ impl ShaderBindingTable {
         let memory_location = MemoryLocation::CpuToGpu;
 
         let buffer = Buffer::new_aligned(
+            ctx,
             buffer_usage,
             memory_location,
             buffer_size as _,

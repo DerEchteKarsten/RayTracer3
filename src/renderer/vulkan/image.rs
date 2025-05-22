@@ -13,7 +13,7 @@ use super::{
 use derivative::Derivative;
 
 #[derive(Derivative)]
-#[derivative(Eq, PartialEq)]
+#[derivative(Eq, PartialEq, Debug)]
 pub struct Image {
     pub(crate) image: vk::Image,
     pub(crate) view: vk::ImageView,
@@ -83,12 +83,12 @@ pub(crate) trait ImageType {
     fn get_view(&self) -> vk::ImageView;
     fn copy(
         &self,
+        ctx: &Context,
         cmd: &vk::CommandBuffer,
         other: &impl ImageType,
         src_layout: vk::ImageLayout,
         dst_layout: vk::ImageLayout,
     ) {
-        let ctx = Context::get();
         unsafe {
             ctx.device.cmd_copy_image(
                 *cmd,
@@ -122,12 +122,12 @@ pub(crate) trait ImageType {
 
     fn blit(
         &self,
+        ctx: &Context,
         cmd: &vk::CommandBuffer,
         other: &impl ImageType,
         src_layout: vk::ImageLayout,
         dst_layout: vk::ImageLayout,
     ) {
-        let ctx = Context::get();
         unsafe {
             ctx.device.cmd_blit_image(
                 *cmd,
@@ -303,13 +303,18 @@ impl ImageType for ImageHandle {
 }
 
 impl Image {
-    pub fn new_from_data(image: DynamicImage, format: vk::Format) -> Result<Self> {
+    pub fn new_from_data(
+        ctx: &mut Context,
+        image: DynamicImage,
+        format: vk::Format,
+    ) -> Result<Self> {
         let (width, height) = image.dimensions();
         let image_buffer = if format != vk::Format::R8G8B8A8_SRGB {
             let image_data = image.to_rgba32f();
             let image_data_raw = image_data.as_raw();
 
             let image_buffer = Buffer::new(
+                ctx,
                 vk::BufferUsageFlags::TRANSFER_SRC,
                 MemoryLocation::CpuToGpu,
                 (size_of::<f32>() * image_data.len()) as u64,
@@ -321,6 +326,7 @@ impl Image {
             let image_data_raw = image_data.as_raw();
 
             let image_buffer = Buffer::new(
+                ctx,
                 vk::BufferUsageFlags::TRANSFER_SRC,
                 MemoryLocation::CpuToGpu,
                 (size_of::<u8>() * image_data.len()) as u64,
@@ -331,13 +337,13 @@ impl Image {
         };
 
         let texture_image = Image::new_2d(
+            ctx,
             vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
             MemoryLocation::GpuOnly,
             format,
             width,
             height,
         )?;
-        let ctx = Context::get();
         ctx.execute_one_time_commands(|cmd| {
             let barrier = texture_image.memory_barrier(
                 vk::ImageLayout::UNDEFINED,
@@ -350,7 +356,12 @@ impl Image {
                 )
             };
 
-            image_buffer.copy_to_image(cmd, &texture_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+            image_buffer.copy_to_image(
+                &ctx,
+                cmd,
+                &texture_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            );
 
             let barrier = texture_image.memory_barrier(
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -395,13 +406,13 @@ impl Image {
     }
 
     pub(crate) fn new_2d(
+        ctx: &mut Context,
         usage: vk::ImageUsageFlags,
         memory_location: MemoryLocation,
         format: vk::Format,
         width: u32,
         height: u32,
     ) -> Result<Self> {
-        let ctx = Context::get_mut();
         let extent = vk::Extent3D {
             width,
             height,

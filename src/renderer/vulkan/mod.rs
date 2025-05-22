@@ -3,7 +3,6 @@ pub(crate) mod device;
 pub(crate) mod image;
 mod physical_device;
 pub(crate) mod raytracing;
-pub(crate) mod sampler;
 pub mod swapchain;
 
 use std::{
@@ -22,6 +21,7 @@ use ash::{
     vk::{self, Handle},
     Device, Entry, Instance,
 };
+use bevy_ecs::{resource::Resource, world::FromWorld};
 use device::{create_device, DEVICE_EXTENSIONS};
 use gpu_allocator::{
     vulkan::{Allocator, AllocatorCreateDesc},
@@ -38,6 +38,7 @@ pub struct Surface {
     pub(crate) vulkan: vk::SurfaceKHR,
 }
 
+#[derive(Resource)]
 pub struct Context {
     pub(crate) device: Device,
     pub(crate) physical_device: PhysicalDevice,
@@ -54,27 +55,7 @@ pub struct Context {
     pub(crate) mesh_fn: ash::ext::mesh_shader::Device,
 }
 
-static mut CONTEXT: MaybeUninit<Context> = MaybeUninit::uninit();
-
 impl Context {
-    pub(crate) fn init(
-        display_handle: &dyn HasDisplayHandle,
-        window_handle: &dyn HasWindowHandle,
-    ) -> Result<()> {
-        unsafe {
-            CONTEXT.write(Context::new(display_handle, window_handle)?);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn get() -> &'static Context {
-        unsafe { CONTEXT.assume_init_ref() }
-    }
-
-    pub(crate) fn get_mut() -> &'static mut Context {
-        unsafe { CONTEXT.assume_init_mut() }
-    }
-
     unsafe extern "system" fn vulkan_debug_callback(
         flag: vk::DebugUtilsMessageSeverityFlagsEXT,
         typ: vk::DebugUtilsMessageTypeFlagsEXT,
@@ -341,11 +322,7 @@ impl Context {
 
         unsafe {
             self.device.queue_submit2(
-                if false {
-                    self.graphics_queue
-                } else {
-                    self.graphics_queue
-                },
+                self.graphics_queue,
                 std::slice::from_ref(&submit_info),
                 fence,
             )?
@@ -394,7 +371,12 @@ impl Context {
         unsafe { self.debug_utils.cmd_end_debug_utils_label(*cmd) };
     }
 
-    pub(crate) fn submit(&self, cmd: &vk::CommandBuffer, wait_semaphores: &[vk::SemaphoreSubmitInfo<'_>], signal_semaphores: &[vk::SemaphoreSubmitInfo<'_>]) {
+    pub(crate) fn submit(
+        &self,
+        cmd: &vk::CommandBuffer,
+        wait_semaphores: &[vk::SemaphoreSubmitInfo<'_>],
+        signal_semaphores: &[vk::SemaphoreSubmitInfo<'_>],
+    ) {
         let command_buffers = [vk::CommandBufferSubmitInfo::default().command_buffer(*cmd)];
 
         let submit = vk::SubmitInfo2::default()
@@ -406,5 +388,5 @@ impl Context {
                 .queue_submit2(self.graphics_queue, &[submit], vk::Fence::null())
                 .unwrap()
         };
-    } 
+    }
 }

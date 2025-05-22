@@ -2,7 +2,8 @@
 #include "random.slang"
 
 struct Bindings{
-    Image4 in;
+    Texture4 depth;
+    Texture4 color;
     Image4 out;
 }
 
@@ -17,5 +18,5 @@ void main(uint3 threadId : SV_DispatchThreadID) {
     //     printf("depth: %i, color: %i, out: %i \n", bindings.depth.handle.index(), bindings.color.handle.index(), bindings.out.handle.index());
     // }
 
-    bindings.out[threadId.xy] = bindings.in[threadId.xy];
+    bindings.out[threadId.xy] = bindings.color[threadId.xy];
 }

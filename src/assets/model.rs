@@ -2,7 +2,7 @@ use std::mem::{size_of, size_of_val};
 
 use super::gltf::{self, Vertex};
 use crate::{
-    backend::{
+    renderer::{
         bindless::{BindlessDescriptorHeap, DescriptorResourceHandle, ImmutableSampler},
         vulkan::{
             raytracing::{AccelerationStructure, RayTracingContext},
@@ -16,13 +16,14 @@ use crate::{
 };
 use anyhow::Result;
 use ash::vk::{self, Filter, Packed24_8};
+use bevy_asset::{io::Reader, Asset, AssetLoader, AsyncReadExt, LoadContext};
+use bevy_reflect::TypePath;
 use glam::{Mat4, Vec4};
 use gpu_allocator::MemoryLocation;
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct GeometryInfo {
-    pub transform: Mat4,
     pub color: [f32; 4],
     pub color_texture: DescriptorResourceHandle,
     pub sampler: ImmutableSampler,
@@ -33,8 +34,7 @@ pub struct GeometryInfo {
     pub roughness: f32,
 }
 
-pub struct Model {
-    pub index_count: u32,
+pub struct RenderModel {
     pub images: Vec<Image>,
     pub blas: Option<AccelerationStructure>,
     pub vertex_buffer: Buffer,
@@ -42,8 +42,6 @@ pub struct Model {
     pub transform_buffer: Buffer,
     pub geometry_info_buffer: Buffer,
     pub geometry_infos: Vec<GeometryInfo>,
-    pub index_counts: Vec<u32>,
-    pub lights: u32,
 }
 
 pub const IDENTITY_MATRIX: vk::TransformMatrixKHR = vk::TransformMatrixKHR {
@@ -67,7 +65,7 @@ pub fn mat4_to_vk_transform(mat: Mat4) -> vk::TransformMatrixKHR {
     vk::TransformMatrixKHR { matrix }
 }
 
-impl Model {
+impl RenderModel {
     pub fn instance(&self, transform: Mat4) -> vk::AccelerationStructureInstanceKHR {
         vk::AccelerationStructureInstanceKHR {
             transform: mat4_to_vk_transform(transform),
@@ -188,9 +186,12 @@ impl Model {
         ImmutableSampler::new(mag_filter, min_filter).unwrap()
     }
 
-    pub fn from_gltf(model: gltf::Model) -> Result<Self> {
-        let ctx = Context::get();
-
+    pub fn from_gltf(
+        ctx: &mut Context,
+        bindless: &mut BindlessDescriptorHeap,
+        raytracing_ctx: Option<&mut RayTracingContext>,
+        model: &gltf::GltfModel,
+    ) -> Result<Self> {
         let vertices = model.vertices.as_slice();
         let indices = model.indices.as_slice();
 
@@ -216,8 +217,10 @@ impl Model {
             .collect::<Vec<_>>();
 
         let transform_buffer = Buffer::from_data(
+            ctx,
             vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+                | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
+                | vk::BufferUsageFlags::STORAGE_BUFFER,
             transforms.as_slice(),
         )?;
 
@@ -229,6 +232,7 @@ impl Model {
             let pixels = i.pixels.as_slice();
 
             let staging = Buffer::new(
+                ctx,
                 vk::BufferUsageFlags::TRANSFER_SRC,
                 MemoryLocation::CpuToGpu,
                 size_of_val(pixels) as _,
@@ -237,13 +241,13 @@ impl Model {
             staging.copy_data_to_buffer(pixels)?;
 
             let image = Image::new_2d(
+                ctx,
                 vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
                 MemoryLocation::GpuOnly,
                 vk::Format::R8G8B8A8_SRGB,
                 width,
                 height,
             )?;
-            let ctx = Context::get();
             ctx.execute_one_time_commands(|cmd| {
                 unsafe {
                     ctx.device.cmd_pipeline_barrier2(
@@ -256,7 +260,7 @@ impl Model {
                     )
                 };
 
-                staging.copy_to_image(cmd, &image, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+                staging.copy_to_image(&ctx, cmd, &image, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
 
                 unsafe {
                     ctx.device.cmd_pipeline_barrier2(
@@ -277,6 +281,7 @@ impl Model {
 
         if images.is_empty() {
             let image = Image::new_2d(
+                ctx,
                 vk::ImageUsageFlags::SAMPLED,
                 MemoryLocation::GpuOnly,
                 vk::Format::R8G8B8A8_SRGB,
@@ -302,10 +307,11 @@ impl Model {
 
         let descriptor_handels = images
             .iter()
-            .map(|e| BindlessDescriptorHeap::get_mut().allocate_texture_handle(&e.handle()))
+            .map(|e| bindless.allocate_texture_handle(&ctx, &e.handle()))
             .collect::<Vec<_>>();
 
         let vertex_buffer = Buffer::from_data(
+            ctx,
             vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
                 | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
                 | vk::BufferUsageFlags::STORAGE_BUFFER
@@ -314,6 +320,7 @@ impl Model {
         )?;
 
         let index_buffer = Buffer::from_data(
+            ctx,
             vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
                 | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
                 | vk::BufferUsageFlags::STORAGE_BUFFER
@@ -356,14 +363,23 @@ impl Model {
             if emission[0] != 0.0 || emission[1] != 0.0 || emission[2] != 0.0 {
                 lights += primitive_count;
             }
-            let texture =
-                model.textures[mesh.material.base_color_texture_index.map_or(0, |i| i as _)];
+            let texture = mesh
+                .material
+                .base_color_texture_index
+                .and_then(|i| Some(model.textures[i as usize]));
             geometry_infos.push(GeometryInfo {
-                transform: Mat4::from_cols_array_2d(&node.transform),
                 color: mesh.material.base_color,
                 emission,
-                color_texture: descriptor_handels[texture.image_index as usize],
-                sampler: Self::map_gltf_sampler(&model.samplers[texture.sampler_index as usize]),
+                color_texture: texture
+                    .and_then(|texture: gltf::Texture| {
+                        Some(descriptor_handels[texture.image_index as usize])
+                    })
+                    .unwrap_or(DescriptorResourceHandle(!0)),
+                sampler: Self::map_gltf_sampler(
+                    &model.samplers[texture
+                        .and_then(|texture| Some(texture.sampler_index as usize))
+                        .unwrap_or(0)],
+                ),
                 metallic_factor: mesh.material.metallic_factor,
                 vertex_offset: mesh.vertex_offset,
                 index_offset: mesh.index_offset,
@@ -392,33 +408,33 @@ impl Model {
             max_primitive_counts.push(primitive_count)
         }
         let geometry_info_buffer = Buffer::from_data(
+            ctx,
             vk::BufferUsageFlags::STORAGE_BUFFER,
             geometry_infos.as_slice(),
         )?;
 
-        let blas = RayTracingContext::get().and_then(|ctx| {
+        let blas = raytracing_ctx.and_then(|raytracing_ctx| {
             Some(
-                ctx.create_acceleration_structure(
-                    vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
-                    &as_geometries,
-                    &as_ranges,
-                    &max_primitive_counts,
-                )
-                .unwrap(),
+                raytracing_ctx
+                    .create_acceleration_structure(
+                        ctx,
+                        vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
+                        &as_geometries,
+                        &as_ranges,
+                        &max_primitive_counts,
+                    )
+                    .unwrap(),
             )
         });
 
         Ok(Self {
-            index_count: indices.len() as u32,
             images,
             geometry_infos,
             blas,
-            index_counts,
             vertex_buffer,
             index_buffer,
             transform_buffer,
             geometry_info_buffer,
-            lights,
         })
     }
 }

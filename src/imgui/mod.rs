@@ -1,7 +1,8 @@
 use ash::vk::{self, ImageLayout, Offset2D};
+use bevy_ecs::resource::Resource;
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
 
-use crate::{backend::vulkan::Context, WINDOW_SIZE};
+use crate::{renderer::vulkan::Context, WINDOW_SIZE};
 
 pub struct ImGui {
     pub context: imgui::Context,

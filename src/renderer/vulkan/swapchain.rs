@@ -23,8 +23,7 @@ pub struct Swapchain {
 }
 
 impl Swapchain {
-    pub fn new() -> Result<Self> {
-        let ctx = Context::get();
+    pub fn new(ctx: &Context) -> Result<Self> {
         let format = {
             let formats = unsafe {
                 ctx.surface.ash.get_physical_device_surface_formats(
@@ -179,8 +178,7 @@ impl Swapchain {
         .0 as usize
     }
 
-    pub fn present(&self, frame_in_flight: usize, swapchain_image: usize) {
-        let ctx = Context::get();
+    pub fn present(&self, ctx: &Context, frame_in_flight: usize, swapchain_image: usize) {
         let binding = [self.frame_resources[frame_in_flight as usize].render_finished_semaphore];
         let swapchains = [self.vk_swapchain];
         let image_indices = [swapchain_image as u32];
