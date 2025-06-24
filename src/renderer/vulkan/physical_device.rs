@@ -19,6 +19,10 @@ impl QueueFamily {
         self.handel.queue_flags.contains(vk::QueueFlags::GRAPHICS)
     }
 
+    pub fn supports_transfer(&self) -> bool {
+        self.handel.queue_flags.contains(vk::QueueFlags::TRANSFER)
+    }
+
     pub fn supports_present(&self) -> bool {
         self.supports_present
     }

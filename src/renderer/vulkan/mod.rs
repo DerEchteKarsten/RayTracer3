@@ -53,6 +53,8 @@ pub struct Context {
     pub(crate) debug_utils: ash::ext::debug_utils::Device,
     pub(crate) _entry: ash::Entry,
     pub(crate) mesh_fn: ash::ext::mesh_shader::Device,
+    pub(crate) transfer_queue: vk::Queue,
+    pub(crate) transfer_queue_family: QueueFamily,
 }
 
 impl Context {
@@ -164,13 +166,13 @@ impl Context {
 
         let physical_devices =
             Self::enumerate_physical_devices(&instance, &ash_surface, &vk_surface)?;
-        let (physical_device, graphics_queue_family, present_queue_family) =
+        let (physical_device, graphics_queue_family, present_queue_family, transfer_queue_family) =
             Self::select_suitable_physical_device(
                 physical_devices.as_slice(),
                 required_extensions,
             )?;
 
-        let queue_families = [&graphics_queue_family, &present_queue_family];
+        let queue_families = [&graphics_queue_family, &present_queue_family, &transfer_queue_family];
 
         let device = create_device(
             &instance,
@@ -181,6 +183,7 @@ impl Context {
 
         let graphics_queue = unsafe { device.get_device_queue(graphics_queue_family.index, 0) };
         let present_queue = unsafe { device.get_device_queue(present_queue_family.index, 0) };
+        let transfer_queue = unsafe { device.get_device_queue(transfer_queue_family.index, 0) };
 
         let allocator = Allocator::new(&AllocatorCreateDesc {
             instance: instance.clone(),
@@ -198,12 +201,14 @@ impl Context {
         })?;
 
         let command_pool_info =
-            vk::CommandPoolCreateInfo::default().queue_family_index(graphics_queue_family.index);
+            vk::CommandPoolCreateInfo::default().queue_family_index(transfer_queue_family.index);
         let command_pool = unsafe { device.create_command_pool(&command_pool_info, None)? };
 
         let debug_utils = debug_utils::Device::new(&instance, &device);
 
         Ok(Self {
+            transfer_queue,
+            transfer_queue_family,
             mesh_fn: mesh_shader::Device::new(&instance, &device),
             allocator,
             surface: Surface {
@@ -246,9 +251,10 @@ impl Context {
     fn select_suitable_physical_device(
         devices: &[PhysicalDevice],
         required_extensions: &[&str],
-    ) -> Result<(PhysicalDevice, QueueFamily, QueueFamily)> {
+    ) -> Result<(PhysicalDevice, QueueFamily, QueueFamily, QueueFamily)> {
         let mut graphics = None;
         let mut present = None;
+        let mut transfer_queue = None;
 
         let device = devices
             .iter()
@@ -264,6 +270,9 @@ impl Context {
 
                     if family.supports_present() && present.is_none() {
                         present = Some(family.clone());
+                    }
+                    if family.supports_transfer() && transfer_queue.is_none() {
+                        transfer_queue = Some(family.clone());
                     }
 
                     if graphics.is_some() && present.is_some() {
@@ -282,11 +291,11 @@ impl Context {
             })
             .ok_or_else(|| anyhow::anyhow!("Could not find a suitable device"))?;
         println!("{}", device.name);
-        Ok((device.clone(), graphics.unwrap(), present.unwrap()))
+        Ok((device.clone(), graphics.unwrap(), present.unwrap(), transfer_queue.unwrap()))
     }
 
-    pub fn execute_one_time_commands<R, F: FnOnce(&vk::CommandBuffer) -> R>(
-        &self,
+    pub fn execute_one_time_commands<R, F: FnOnce(&vk::CommandBuffer, &mut Context) -> R>(
+        &mut self,
         executor: F,
     ) -> Result<R> {
         let command_buffer = unsafe {
@@ -305,7 +314,7 @@ impl Context {
                 .begin_command_buffer(command_buffer, &begin_info)?
         };
 
-        let executor_result = executor(&command_buffer);
+        let executor_result = executor(&command_buffer, self);
 
         unsafe { self.device.end_command_buffer(command_buffer)? };
 
@@ -322,7 +331,7 @@ impl Context {
 
         unsafe {
             self.device.queue_submit2(
-                self.graphics_queue,
+                self.transfer_queue,
                 std::slice::from_ref(&submit_info),
                 fence,
             )?

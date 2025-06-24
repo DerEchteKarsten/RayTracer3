@@ -5,16 +5,11 @@
 #![feature(int_roundings)]
 #![feature(rustc_private)]
 #![feature(map_try_insert)]
-
+#![feature(f16)]
 pub mod assets;
 pub mod components;
 pub mod imgui;
 pub mod renderer;
-use assets::{
-    gltf::{self, GltfModel},
-    model::RenderModel,
-    Model, ModelPlugin,
-};
 use bevy_a11y::AccessibilityPlugin;
 use bevy_app::prelude::*;
 use bevy_asset::{AssetApp, AssetPlugin, AssetServer, Assets, Handle};
@@ -60,6 +55,8 @@ use winit::{
     window::WindowAttributes,
 };
 
+use crate::assets::{GltfMesh, GltfMeshLoader, Mesh, MeshAssets};
+
 const WINDOW_SIZE: IVec2 = IVec2::new(1920, 1088);
 
 fn init(mut cmd: Commands, asset_server: Res<AssetServer>) {
@@ -75,13 +72,13 @@ fn init(mut cmd: Commands, asset_server: Res<AssetServer>) {
         0.1,
         1000.0,
     );
-    let model = asset_server.load("box.glb");
+    let model: Handle<Mesh> = asset_server.load("box.glb");
     cmd.insert_resource(controles);
     cmd.spawn(camera);
-    cmd.spawn((
-        Instance { model },
-        Transform::from_position(Vec3::new(0.0, 0.0, 0.0)),
-    ));
+    // cmd.spawn((
+    //     Instance { model },
+    //     Transform::from_position(Vec3::new(0.0, 0.0, 0.0)),
+    // ));
 }
 
 fn update(mut cmd: Commands, query: Query<&Camera>) {
@@ -113,18 +110,18 @@ fn main() {
                 }),
             },
             AssetPlugin {
-                mode: bevy_asset::AssetMode::Unprocessed,
-                watch_for_changes_override: Some(false),
+                mode: bevy_asset::AssetMode::Processed,
                 ..Default::default()
             },
             WinitPlugin::<bevy_winit::WakeUp>::default(),
             TimePlugin,
             RenderPlugin,
             CameraPlugin,
-            ModelPlugin,
+            // ModelPlugin,
             TaskPoolPlugin::default(),
             // ScenePlugin,
             // UiPlugin::default(),
+            MeshAssets,
         ))
         .add_systems(Startup, init.after(renderer::init))
         .add_systems(Update, update)

@@ -31,7 +31,7 @@ pub const DEVICE_EXTENSIONS: [&'static CStr; 13] = [
 pub(super) fn create_device(
     instance: &ash::Instance,
     physical_device: &PhysicalDevice,
-    queue_families: &[&QueueFamily; 2],
+    queue_families: &[&QueueFamily; 3],
     required_extensions: &[&str],
 ) -> Result<ash::Device> {
     let queue_priorities = [1.0f32];

@@ -9,9 +9,9 @@ use bevy_ecs::resource::Resource;
 use gpu_allocator::{vulkan::Allocation, MemoryLocation};
 use log::debug;
 
-use crate::PipelineCache;
+use crate::{renderer::bindless::BindlessDescriptorHeap, PipelineCache};
 
-use super::{buffer::Buffer, Context};
+use super::{buffer::{Buffer, BufferHandle, BufferType, DynamicBuffer}, Context};
 
 pub fn alinged_size(size: u32, alignment: u32) -> u32 {
     (size + (alignment - 1)) & !(alignment - 1)
@@ -41,8 +41,7 @@ pub enum RayTracingShaderGroup {
 pub struct AccelerationStructure {
     pub(crate) ty: vk::AccelerationStructureTypeKHR,
     pub(crate) accel: vk::AccelerationStructureKHR,
-    pub(crate) address: vk::DeviceAddress,
-    pub(crate) buffer: Buffer,
+    pub(crate) size: u64,
 }
 
 #[derive(Resource)]
@@ -93,6 +92,11 @@ impl RayTracingContext {
         as_geometry: &[vk::AccelerationStructureGeometryKHR],
         as_ranges: &[vk::AccelerationStructureBuildRangeInfoKHR],
         max_primitive_counts: &[u32],
+        buffer: &impl BufferType,
+        offset: u64,
+        scratch_buffer: &mut DynamicBuffer,
+        cmd: &vk::CommandBuffer,
+        bindless: &mut BindlessDescriptorHeap,
     ) -> Result<AccelerationStructure> {
         let build_geo_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
             .ty(level)
@@ -111,34 +115,16 @@ impl RayTracingContext {
             size_info
         };
 
-        let buffer = Buffer::new(
-            ctx,
-            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR,
-            MemoryLocation::GpuOnly,
-            build_size.acceleration_structure_size,
-        )?;
-
         let create_info = vk::AccelerationStructureCreateInfoKHR::default()
-            .buffer(buffer.buffer)
+            .buffer(buffer.to_vk())
+            .offset(offset)
             .size(build_size.acceleration_structure_size)
             .ty(level);
         let handle = unsafe {
             self.acceleration_structure_fn
                 .create_acceleration_structure(&create_info, None)?
         };
-
-        let scratch_buffer = Buffer::new_aligned(
-            ctx,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
-            MemoryLocation::GpuOnly,
-            build_size.build_scratch_size,
-            Some(
-                self.acceleration_structure_properties
-                    .min_acceleration_structure_scratch_offset_alignment
-                    .into(),
-            ),
-        )?;
-
+        scratch_buffer.cmd_grow_to_size(build_size.build_scratch_size, ctx, bindless, cmd);
         let build_geo_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
             .ty(level)
             .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
@@ -146,28 +132,18 @@ impl RayTracingContext {
             .geometries(as_geometry)
             .dst_acceleration_structure(handle)
             .scratch_data(vk::DeviceOrHostAddressKHR {
-                device_address: scratch_buffer.address,
+                device_address: scratch_buffer.get_address(),
             });
 
-        ctx.execute_one_time_commands(|cmd_buffer| {
-            unsafe {
-                self.acceleration_structure_fn
-                    .cmd_build_acceleration_structures(*cmd_buffer, &[build_geo_info], &[as_ranges])
-            };
-        })?;
-
-        let address_info =
-            vk::AccelerationStructureDeviceAddressInfoKHR::default().acceleration_structure(handle);
-        let address = unsafe {
+        unsafe {
             self.acceleration_structure_fn
-                .get_acceleration_structure_device_address(&address_info)
+                .cmd_build_acceleration_structures(*cmd, &[build_geo_info], &[as_ranges])
         };
-
+        
         Ok(AccelerationStructure {
-            buffer,
             accel: handle,
-            address,
             ty: level,
+            size: build_size.acceleration_structure_size,
         })
     }
 

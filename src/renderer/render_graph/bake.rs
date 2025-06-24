@@ -11,7 +11,7 @@ use bevy_ecs::{system::ResMut, world::World};
 use crate::{
     raytracing::RayTracingContext,
     renderer::bindless::BindlessDescriptorHeap,
-    vulkan::{image::ImageType, swapchain::FRAMES_IN_FLIGHT, Context},
+    vulkan::{buffer::BufferType, image::ImageType, swapchain::FRAMES_IN_FLIGHT, Context},
 };
 
 use super::{
@@ -128,7 +128,7 @@ impl RenderGraph {
                                 dst_stage_mask: barrier.stages,
                                 buffer: buffer.buffer,
                                 offset: 0,
-                                size: vk::WHOLE_SIZE,
+                                size: buffer.get_size(),
                                 ..Default::default()
                             });
                         };

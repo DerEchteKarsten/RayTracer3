@@ -303,80 +303,80 @@ impl ImageType for ImageHandle {
 }
 
 impl Image {
-    pub fn new_from_data(
-        ctx: &mut Context,
-        image: DynamicImage,
-        format: vk::Format,
-    ) -> Result<Self> {
-        let (width, height) = image.dimensions();
-        let image_buffer = if format != vk::Format::R8G8B8A8_SRGB {
-            let image_data = image.to_rgba32f();
-            let image_data_raw = image_data.as_raw();
+    // pub fn new_from_data(
+    //     ctx: &mut Context,
+    //     image: DynamicImage,
+    //     format: vk::Format,
+    // ) -> Result<Self> {
+    //     let (width, height) = image.dimensions();
+    //     let image_buffer = if format != vk::Format::R8G8B8A8_SRGB {
+    //         let image_data = image.to_rgba32f();
+    //         let image_data_raw = image_data.as_raw();
 
-            let image_buffer = Buffer::new(
-                ctx,
-                vk::BufferUsageFlags::TRANSFER_SRC,
-                MemoryLocation::CpuToGpu,
-                (size_of::<f32>() * image_data.len()) as u64,
-            )?;
-            image_buffer.copy_data_to_buffer(image_data_raw.as_slice())?;
-            image_buffer
-        } else {
-            let image_data = image.to_rgba8();
-            let image_data_raw = image_data.as_raw();
+    //         let image_buffer = Buffer::new(
+    //             ctx,
+    //             vk::BufferUsageFlags::TRANSFER_SRC,
+    //             MemoryLocation::CpuToGpu,
+    //             (size_of::<f32>() * image_data.len()) as u64,
+    //         )?;
+    //         image_buffer.copy_data_to_buffer(image_data_raw.as_slice())?;
+    //         image_buffer
+    //     } else {
+    //         let image_data = image.to_rgba8();
+    //         let image_data_raw = image_data.as_raw();
 
-            let image_buffer = Buffer::new(
-                ctx,
-                vk::BufferUsageFlags::TRANSFER_SRC,
-                MemoryLocation::CpuToGpu,
-                (size_of::<u8>() * image_data.len()) as u64,
-            )?;
+    //         let image_buffer = Buffer::new(
+    //             ctx,
+    //             vk::BufferUsageFlags::TRANSFER_SRC,
+    //             MemoryLocation::CpuToGpu,
+    //             (size_of::<u8>() * image_data.len()) as u64,
+    //         )?;
 
-            image_buffer.copy_data_to_buffer(image_data_raw.as_slice())?;
-            image_buffer
-        };
+    //         image_buffer.copy_data_to_buffer(image_data_raw.as_slice())?;
+    //         image_buffer
+    //     };
 
-        let texture_image = Image::new_2d(
-            ctx,
-            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
-            MemoryLocation::GpuOnly,
-            format,
-            width,
-            height,
-        )?;
-        ctx.execute_one_time_commands(|cmd| {
-            let barrier = texture_image.memory_barrier(
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            );
-            unsafe {
-                ctx.device.cmd_pipeline_barrier2(
-                    *cmd,
-                    &vk::DependencyInfo::default().image_memory_barriers(&[barrier]),
-                )
-            };
+    //     let texture_image = Image::new_2d(
+    //         ctx,
+    //         vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+    //         MemoryLocation::GpuOnly,
+    //         format,
+    //         width,
+    //         height,
+    //     )?;
+    //     ctx.execute_one_time_commands(|cmd| {
+    //         let barrier = texture_image.memory_barrier(
+    //             vk::ImageLayout::UNDEFINED,
+    //             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+    //         );
+    //         unsafe {
+    //             ctx.device.cmd_pipeline_barrier2(
+    //                 *cmd,
+    //                 &vk::DependencyInfo::default().image_memory_barriers(&[barrier]),
+    //             )
+    //         };
 
-            image_buffer.copy_to_image(
-                &ctx,
-                cmd,
-                &texture_image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            );
+    //         image_buffer.copy_to_image(
+    //             &ctx,
+    //             cmd,
+    //             &texture_image,
+    //             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+    //         );
 
-            let barrier = texture_image.memory_barrier(
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            );
-            unsafe {
-                ctx.device.cmd_pipeline_barrier2(
-                    *cmd,
-                    &vk::DependencyInfo::default().image_memory_barriers(&[barrier]),
-                )
-            };
-        })?;
-        let extend = texture_image.extent;
-        Ok(texture_image)
-    }
+    //         let barrier = texture_image.memory_barrier(
+    //             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+    //             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+    //         );
+    //         unsafe {
+    //             ctx.device.cmd_pipeline_barrier2(
+    //                 *cmd,
+    //                 &vk::DependencyInfo::default().image_memory_barriers(&[barrier]),
+    //             )
+    //         };
+    //     })?;
+    //     let extend = texture_image.extent;
+    //     Ok(texture_image)
+    // }
 
     pub(super) fn view(
         device: &ash::Device,
@@ -437,7 +437,7 @@ impl Image {
             name: "image",
             requirements,
             location: memory_location,
-            linear: true,
+            linear: false,
             allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
         })?;
 

@@ -7,13 +7,18 @@ use bevy_winit::WinitWindows;
 use bindless::BindlessDescriptorHeap;
 use glam::Vec2;
 use render_graph::{
-    begin_frame, build::{DispatchSize, ImageSize}, draw_frame, executions::{ComputePass, RasterPass, WorkSize2D}, resources::ResourceHandle, RenderGraph, IMPORTED
+    begin_frame,
+    build::{DispatchSize, ImageSize},
+    draw_frame,
+    executions::{ComputePass, RasterPass, WorkSize2D},
+    resources::ResourceHandle,
+    RenderGraph, IMPORTED,
 };
 use vulkan::Context;
-use world::{apply_transform, extract_instances, removed_instances, WorldResources};
+use world::WorldResources;
 
 use crate::{
-    components::camera::Camera, raytracing::RayTracingContext, PipelineCache, WINDOW_SIZE,
+    components::camera::Camera, raytracing::RayTracingContext, renderer::world::init_world, PipelineCache, WINDOW_SIZE
 };
 
 pub(crate) mod bindless;
@@ -57,9 +62,12 @@ struct GConst {
     pub pad: [u32; 2],
 }
 
-
-
-fn commands(mut rg: ResMut<RenderGraph>, world: Res<WorldResources>, mut gconst: ResMut<GConst>, query: Query<&Camera>) {
+fn commands(
+    mut rg: ResMut<RenderGraph>,
+    world: Res<WorldResources>,
+    mut gconst: ResMut<GConst>,
+    query: Query<&Camera>,
+) {
     let camera = query.single().unwrap();
     gconst.proj = camera.projection_matrix();
     gconst.proj_inverse = gconst.proj.inverse();
@@ -93,11 +101,10 @@ fn commands(mut rg: ResMut<RenderGraph>, world: Res<WorldResources>, mut gconst:
 }
 
 pub fn RenderPlugin(app: &mut App) {
-    app
-    .add_systems(PreStartup, init)
-    .add_systems(Update, (apply_transform, extract_instances, removed_instances))
-    .add_systems(
-        PostUpdate,
-        (begin_frame, (commands, draw_frame).chain()).chain(),
-    );
+    app.add_systems(PreStartup, init)
+        .add_systems(Startup, init_world)
+        .add_systems(
+            PostUpdate,
+            (begin_frame, (commands, draw_frame).chain()).chain(),
+        );
 }

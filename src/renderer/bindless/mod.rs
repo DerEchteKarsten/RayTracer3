@@ -208,7 +208,7 @@ impl BindlessDescriptorHeap {
         let buffer_info = [vk::DescriptorBufferInfo {
             buffer: buffer.to_vk(),
             offset: 0,
-            range: vk::WHOLE_SIZE,
+            range: buffer.get_size(),
         }];
 
         let write = [vk::WriteDescriptorSet {
@@ -227,20 +227,16 @@ impl BindlessDescriptorHeap {
         handle
     }
 
-    pub fn allocate_buffer_handle_in_sequence(
+    pub fn update_buffer_handle(
         &mut self,
         ctx: &Context,
         buffer: &impl BufferType,
-    ) -> DescriptorResourceHandle {
-        // let handle = Self::fetch_available_descriptor(self, RenderResourceTag::Buffer);
-        let handle = DescriptorResourceHandle::new(
-            RenderResourceTag::Buffer,
-            self.increment_descriptor(BindlessTableType::Buffers),
-        );
+        handle: DescriptorResourceHandle,
+    ) {
         let buffer_info = [vk::DescriptorBufferInfo {
             buffer: buffer.to_vk(),
             offset: 0,
-            range: vk::WHOLE_SIZE,
+            range: buffer.get_size(),
         }];
 
         let write = [vk::WriteDescriptorSet {
@@ -255,8 +251,6 @@ impl BindlessDescriptorHeap {
         unsafe {
             ctx.device.update_descriptor_sets(&write, &[]);
         };
-
-        handle
     }
 
     pub fn allocate_image_handle(
