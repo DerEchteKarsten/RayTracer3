@@ -55,9 +55,12 @@ use winit::{
     window::WindowAttributes,
 };
 
-use crate::assets::{GltfMesh, GltfMeshLoader, Mesh, MeshAssets};
+use crate::assets::{GltfMesh, GltfMeshLoader, Mesh, MeshAssets, MeshLoader};
 
 const WINDOW_SIZE: IVec2 = IVec2::new(1920, 1088);
+
+#[derive(Resource)]
+struct MeshHandle(Handle<Mesh>);
 
 fn init(mut cmd: Commands, asset_server: Res<AssetServer>) {
     let controles = Controls {
@@ -73,6 +76,7 @@ fn init(mut cmd: Commands, asset_server: Res<AssetServer>) {
         1000.0,
     );
     let model: Handle<Mesh> = asset_server.load("box.glb");
+    cmd.insert_resource(MeshHandle(model));
     cmd.insert_resource(controles);
     cmd.spawn(camera);
     // cmd.spawn((
@@ -81,8 +85,12 @@ fn init(mut cmd: Commands, asset_server: Res<AssetServer>) {
     // ));
 }
 
-fn update(mut cmd: Commands, query: Query<&Camera>) {
+fn update(mut cmd: Commands, query: Query<&Camera>, mesh: Res<MeshHandle>, server: Res<Assets<Mesh>>) {
     let camera = query.single().unwrap();
+    if let Some(mesh) = server.get(&mesh.0) {
+        log::info!("{:?}", mesh);
+    }
+    
     // log::info!("{:#?}", camera);
 }
 

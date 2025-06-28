@@ -148,7 +148,7 @@ impl<'a> Reader for MReader<'a> {
     }
 }
 
-struct MeshLoader;
+pub struct MeshLoader;
 impl AssetLoader for MeshLoader {
     type Asset = Mesh;
     type Error = anyhow::Error;
