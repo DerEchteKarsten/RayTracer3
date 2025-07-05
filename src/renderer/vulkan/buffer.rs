@@ -1,3 +1,5 @@
+use std::{ffi::c_void, ptr::NonNull};
+
 use anyhow::{Error, Result};
 use ash::vk;
 use derivative::Derivative;
@@ -260,11 +262,18 @@ struct RawDynamicBuffer {
     allocation: Option<Allocation>,
 }
 
+impl Clone for RawDynamicBuffer {
+    fn clone(&self) -> Self {
+        Self { buffer: self.buffer, address: self.address, allocation: None }
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct DynamicBuffer {
     buffer: RawDynamicBuffer,
     capacity: u64,
     usage: vk::BufferUsageFlags,
-    size: u64,
+    pub size: u64,
     memory_location: MemoryLocation,
     override_alignment: Option<u64>,
     pub bindless_handle: DescriptorResourceHandle,
@@ -337,7 +346,7 @@ impl DynamicBuffer {
         let old_size = self.size;
         self.size = size;
         if size > self.capacity {
-            self.capacity *= 1 << (64 - (self.capacity / self.size).leading_zeros() - 1);
+            self.capacity = self.size.next_power_of_two();
 
             let buffer = self.create_buffer(ctx)?;
             ctx.execute_one_time_commands(|cmd, ctx | {
@@ -347,7 +356,7 @@ impl DynamicBuffer {
                     src_offset: 0,
                     dst_offset: 0,
                 }]) };
-            });
+            })?;
             unsafe { ctx.device.destroy_buffer(self.buffer.buffer, None) };
             ctx.allocator
                 .free(self.buffer.allocation.take().ok_or(Error::msg("Buffer not Owned"))?)
@@ -381,16 +390,32 @@ impl DynamicBuffer {
         Ok(())
     }
 
-    pub(crate) fn copy_from(&mut self, ctx: &mut Context, bindless: &mut BindlessDescriptorHeap, src_buffer: &impl BufferType, offset: u64) -> Result<()>{
-        if self.size < src_buffer.get_size() + offset {
-            self.grow_to_size(src_buffer.get_size() + offset, ctx, bindless);
+    pub(crate) fn copy_from(&mut self, ctx: &mut Context, bindless: &mut BindlessDescriptorHeap, src_buffer: &impl BufferType, offset: u64, size: u64) -> Result<()>{
+        if self.size < size + offset {
+            self.grow_to_size(size + offset, ctx, bindless)?;
         }
         ctx.execute_one_time_commands(|cmd, ctx| {
             unsafe { ctx.device.cmd_copy_buffer(*cmd, src_buffer.to_vk(), self.buffer.buffer, &[vk::BufferCopy {
                             src_offset: 0,
-                            size: src_buffer.get_size(),
+                            size: size,
                             dst_offset: offset,
                         }]) };
         })
+    }
+
+    pub(crate) fn push<T>(&mut self, ctx: &mut Context, bindless: &mut BindlessDescriptorHeap, staging_buffer: &Buffer, data: &[T]) {
+        let offset = self.size;
+        let size = data.len() * size_of::<T>();
+        for i in 0..(size.div_ceil(staging_buffer.size as usize) +1) {
+            unsafe { staging_buffer
+                    .allocation
+                    .as_ref()
+                    .unwrap()
+                    .mapped_ptr()
+                    .unwrap()
+                    .copy_from(NonNull::from_ref(data).cast().add(i * staging_buffer.size as usize), size.min(staging_buffer.size as usize)) };
+    
+            self.copy_from(ctx, bindless, staging_buffer, offset + i as u64 * staging_buffer.size as u64, size as u64).unwrap();
+        }
     }
 }

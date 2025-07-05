@@ -18,7 +18,7 @@ use vulkan::Context;
 use world::WorldResources;
 
 use crate::{
-    components::camera::Camera, raytracing::RayTracingContext, renderer::world::init_world, PipelineCache, WINDOW_SIZE
+    components::camera::Camera, raytracing::RayTracingContext, renderer::world::{add_instance, init_world, loaded_assets, RenderWorld}, PipelineCache, WINDOW_SIZE
 };
 
 pub(crate) mod bindless;
@@ -65,6 +65,7 @@ struct GConst {
 fn commands(
     mut rg: ResMut<RenderGraph>,
     world: Res<WorldResources>,
+    render_world: Res<RenderWorld>,
     mut gconst: ResMut<GConst>,
     query: Query<&Camera>,
 ) {
@@ -86,11 +87,15 @@ fn commands(
         .fragment_entry("fragment")
         .mesh_entry("mesh")
         .constants(gconst.as_ref())
-        .read(IMPORTED, world.instances)
+        
+        .read(IMPORTED, world.vertex_buffer)
+        .read(IMPORTED, world.index_buffer)
+        .read(IMPORTED, world.meshlet_buffer)
+
         .depth_attachment(IMPORTED, depth)
         .color_attachment(IMPORTED, color, Some([0.1, 0.15, 0.3, 1.0]))
         .render_area(WorkSize2D::FullScreen)
-        .draw(DispatchSize::X(1));
+        .draw(DispatchSize::X(render_world.num_instances as u32));
 
     ComputePass::new(&mut rg, "test")
         .shader("bindless_test")
@@ -103,6 +108,7 @@ fn commands(
 pub fn RenderPlugin(app: &mut App) {
     app.add_systems(PreStartup, init)
         .add_systems(Startup, init_world)
+        .add_systems(Update, (loaded_assets, add_instance))
         .add_systems(
             PostUpdate,
             (begin_frame, (commands, draw_frame).chain()).chain(),

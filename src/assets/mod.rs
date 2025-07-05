@@ -1,4 +1,4 @@
-use std::future::IntoFuture;
+use std::{future::IntoFuture, mem::offset_of};
 
 use anyhow::{Ok, Result};
 use bevy_app::Plugin;
@@ -7,7 +7,7 @@ use bevy_reflect::TypePath;
 use bincode::{config::Configuration, de::read::Reader, enc::write::Writer};
 use futures::executor::block_on;
 use glam::vec3;
-use meshopt;
+use meshopt::{self, VertexDataAdapter};
 use serde::Serialize;
 
 use crate::renderer::bindless::DescriptorResourceHandle;
@@ -42,7 +42,7 @@ pub struct Bounds {
 
 #[repr(C)]
 #[derive(bincode::Encode, bincode::Decode)]
-struct Meshlet {
+pub struct Meshlet {
     vertex_offset: u32,
     triangle_offset: u32,
     vertex_count: u32,
@@ -51,7 +51,7 @@ struct Meshlet {
 
 #[repr(C)]
 #[derive(Debug)]
-struct Material {
+pub struct Material {
     metalic_factor: f16,
     roughness_factor: f16,
     color: [f16; 3],
@@ -117,15 +117,15 @@ impl<'a, Context> bincode::BorrowDecode<'a, Context> for Material {
 
 #[derive(bevy_asset::Asset, TypePath, bincode::Encode, bincode::Decode)]
 pub struct Mesh {
-    meshlets: Vec<Meshlet>,
-    bounds: Vec<Bounds>,
-    materials: Vec<Material>,
-    vertices: Vec<Vertex>,
-    indices: Vec<u8>,
+    pub meshlets: Vec<Meshlet>,
+    pub materials: Vec<Material>,
+    pub vertices: Vec<Vertex>,
+    pub indices: Vec<u8>,
+    pub uploaded: bool,
 }
 
 #[repr(C)]
-#[derive(bincode::Encode, bincode::Decode)]
+#[derive(bincode::Encode, bincode::Decode, Clone)]
 pub struct Vertex {
     pub p: [f32; 3],
     pub n: [f32; 3],
@@ -159,7 +159,7 @@ impl AssetLoader for MeshLoader {
             settings: &Self::Settings,
             load_context: &mut LoadContext<'_>,
         ) -> std::result::Result<Self::Asset, Self::Error> {
-        let mesh = bincode::decode_from_reader(MReader(reader), CONFIG)?;
+        let mesh: Mesh = bincode::decode_from_reader(MReader(reader), CONFIG)?;
         Ok(mesh)
     }
     fn extensions(&self) -> &[&str] {
@@ -199,6 +199,11 @@ impl AssetLoader for GltfMeshLoader {
     }
 }
 
+#[inline(always)]
+pub fn typed_to_bytes<T: Sized>(typed: &[T]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(typed.as_ptr().cast(), std::mem::size_of_val(typed)) }
+}
+
 struct MeshTransformer;
 impl AssetTransformer for MeshTransformer {
     type AssetInput = GltfMesh;
@@ -210,54 +215,71 @@ impl AssetTransformer for MeshTransformer {
             asset: bevy_asset::transformer::TransformedAsset<Self::AssetInput>,
             settings: &'a Self::Settings,
         ) -> std::result::Result<bevy_asset::transformer::TransformedAsset<Self::AssetOutput>, Self::Error> {
-        let mut mesh = Mesh {
-            indices: Vec::new(),
-            materials: Vec::new(),
-            meshlets: Vec::new(),
-            vertices: Vec::new(),
-            bounds: Vec::new(),
+
+        let mut verticies = vec![];
+        let mut materials = vec![];
+        let primitive = asset.document.meshes().next().unwrap().primitives().next().unwrap();
+        let reader = primitive.reader(|buffer| Some(&asset.buffers[buffer.index()]));
+
+        let normals = reader
+            .read_normals()
+            .unwrap()
+            .collect::<Vec<_>>();
+
+        let uvs = reader
+            .read_tex_coords(0)
+            .map(|reader| reader.into_f32().collect::<Vec<_>>());
+
+        reader.read_positions().unwrap().enumerate().for_each(|(index, p)| {
+            let n = normals[index];    
+            let t = uvs.as_ref().map_or([0.0, 0.0], |uvs| uvs[index]);
+
+            verticies.push(Vertex {
+                n,
+                p,
+                t
+            });
+        });
+
+        let mut indecies = reader.read_indices().unwrap().into_u32().collect::<Vec<u32>>();
+        let pmaterial = primitive.material();
+        let pbr = pmaterial.pbr_metallic_roughness();
+        materials.push(Material {
+            color: [pbr.base_color_factor()[0] as f16, pbr.base_color_factor()[1] as f16, pbr.base_color_factor()[2] as f16],
+            metalic_factor: pbr.metallic_factor() as f16,
+            roughness_factor: pbr.roughness_factor() as f16,
+            texture_offset: pbr.base_color_texture().map(|v| { v.texture().index() as u16 }).unwrap_or(!0u16),
+        });
+        meshopt::optimize_vertex_cache(&indecies, verticies.len());
+        let vertex_reader = VertexDataAdapter::new(
+            typed_to_bytes(&verticies),
+            std::mem::size_of::<Vertex>(),
+            offset_of!(Vertex, p),
+        ).unwrap();
+        meshopt::optimize_overdraw_in_place(&mut indecies, &vertex_reader, 3.0);
+        meshopt::optimize_vertex_fetch_in_place(&mut indecies, &mut verticies);
+        let vertex_reader = VertexDataAdapter::new(
+            typed_to_bytes(&verticies),
+            std::mem::size_of::<Vertex>(),
+            offset_of!(Vertex, p),
+        ).unwrap();
+        
+        let meshlets = meshopt::build_meshlets(&indecies, &vertex_reader, 64, 124, 0.0);
+        let meshlet_vertecies = meshlets.vertices.iter().map(|i| {verticies[*i as usize].clone()}).collect::<Vec<Vertex>>(); 
+
+        let mesh = Mesh {
+            indices: meshlets.triangles,
+            materials,
+            meshlets: meshlets.meshlets.iter().map(|m| Meshlet {
+                triangle_count: m.triangle_count,
+                triangle_offset: m.triangle_offset,
+                vertex_count: m.vertex_count,
+                vertex_offset: m.vertex_offset,
+            }).collect::<Vec<_>>(),
+            vertices: meshlet_vertecies,
+            uploaded: false,
         };
 
-        let mut global_verticies: Vec<u32> = Vec::new();
-        let mut materials = Vec::new();
-
-        for i in asset.document.meshes() {
-            for primitive in i.primitives() {
-                let reader = primitive.reader(|buffer| Some(&asset.buffers[buffer.index()]));
-
-                let normals = reader
-                    .read_normals()
-                    .unwrap()
-                    .collect::<Vec<_>>();
-    
-                let uvs = reader
-                    .read_tex_coords(0)
-                    .map(|reader| reader.into_f32().collect::<Vec<_>>());
-    
-                reader.read_positions().unwrap().enumerate().for_each(|(index, p)| {
-                    let n = normals[index];    
-                    let t = uvs.as_ref().map_or([0.0, 0.0], |uvs| uvs[index]);
-    
-                    mesh.vertices.push(Vertex {
-                        n,
-                        p,
-                        t
-                    });
-                });
-    
-                let index_reader = reader.read_indices().unwrap().into_u32();
-                global_verticies.extend(index_reader.collect::<Vec<u32>>());
-                let pmaterial = primitive.material();
-                let pbr = pmaterial.pbr_metallic_roughness();
-                materials.push(Material {
-                    color: [pbr.base_color_factor()[0] as f16, pbr.base_color_factor()[1] as f16, pbr.base_color_factor()[2] as f16],
-                    metalic_factor: pbr.metallic_factor() as f16,
-                    roughness_factor: pbr.roughness_factor() as f16,
-                    texture_offset: pbr.base_color_texture().map(|v| { v.texture().index() as u16 }).unwrap_or(!0u16),
-                });
-            }
-        }
-        log::info!("{:?}", materials);
         let asset = asset.replace_asset(mesh);
         return Ok(asset);
     }

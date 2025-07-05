@@ -6,6 +6,7 @@
 #![feature(rustc_private)]
 #![feature(map_try_insert)]
 #![feature(f16)]
+#![feature(non_null_from_ref)]
 pub mod assets;
 pub mod components;
 pub mod imgui;
@@ -59,8 +60,6 @@ use crate::assets::{GltfMesh, GltfMeshLoader, Mesh, MeshAssets, MeshLoader};
 
 const WINDOW_SIZE: IVec2 = IVec2::new(1920, 1088);
 
-#[derive(Resource)]
-struct MeshHandle(Handle<Mesh>);
 
 fn init(mut cmd: Commands, asset_server: Res<AssetServer>) {
     let controles = Controls {
@@ -76,20 +75,16 @@ fn init(mut cmd: Commands, asset_server: Res<AssetServer>) {
         1000.0,
     );
     let model: Handle<Mesh> = asset_server.load("box.glb");
-    cmd.insert_resource(MeshHandle(model));
     cmd.insert_resource(controles);
     cmd.spawn(camera);
-    // cmd.spawn((
-    //     Instance { model },
-    //     Transform::from_position(Vec3::new(0.0, 0.0, 0.0)),
-    // ));
+    cmd.spawn((
+        Instance { model },
+        Transform::from_position(Vec3::new(0.0, 0.0, 0.0)),
+    ));
 }
 
-fn update(mut cmd: Commands, query: Query<&Camera>, mesh: Res<MeshHandle>, server: Res<Assets<Mesh>>) {
+fn update(mut cmd: Commands, query: Query<&Camera>, server: Res<Assets<Mesh>>) {
     let camera = query.single().unwrap();
-    if let Some(mesh) = server.get(&mesh.0) {
-        log::info!("{:?}", mesh);
-    }
     
     // log::info!("{:#?}", camera);
 }

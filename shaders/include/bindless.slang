@@ -19,13 +19,6 @@ struct RenderResourceHandle {
         return handle >> 30;
     }
 }
-struct InstanceInfo {
-    RenderResourceHandle index_buffer;
-    RenderResourceHandle vertex_buffer;
-    RenderResourceHandle transform_buffer;
-    RenderResourceHandle geometry_buffer;
-    float4x4 transform;
-}
 
 [[vk::push_constant]] ConstantBuffer<Offsets> g_offsets;
 

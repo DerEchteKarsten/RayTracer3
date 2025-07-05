@@ -5,7 +5,6 @@ static const float BACKGROUND_DEPTH = 100000.0;
 struct Vertex {
 	float3 pos;
 	float3 normal;
-	float3 color;
 	float2 uvs;
 };
 
@@ -18,6 +17,13 @@ struct GeometryInfo {
 	float4 emission;
 	float roughness;
 };
+
+struct Meshlet {
+    uint vertex_offset;
+    uint triangle_offset;
+    uint vertex_count;
+    uint triangle_count;
+}
 
 struct GConst {
     column_major float4x4 proj;

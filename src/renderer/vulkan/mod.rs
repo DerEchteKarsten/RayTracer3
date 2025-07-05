@@ -38,6 +38,8 @@ pub struct Surface {
     pub(crate) vulkan: vk::SurfaceKHR,
 }
 
+static CTX: MaybeUninit<Context> = MaybeUninit::uninit();
+
 #[derive(Resource)]
 pub struct Context {
     pub(crate) device: Device,
